@@ -1,0 +1,21 @@
+[package]
+name = "claude-dbus"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "claude-dbus"
+path = "src/main.rs"
+
+[[bin]]
+name = "claude-hook"
+path = "src/claude_hook.rs"
+
+[dependencies]
+zbus = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
