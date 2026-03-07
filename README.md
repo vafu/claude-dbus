@@ -1,6 +1,6 @@
 # claude-dbus
 
-A Rust D-Bus service that bridges [Claude Code](https://claude.ai/claude-code) hooks to an AGS/GTK4 bar widget. It shows per-session status (thinking / idle / attention / compacting), context window usage, and routes permission/elicitation popups to the bar.
+A Rust D-Bus service that bridges [Claude Code](https://claude.ai/claude-code) hooks to D-Bus signals. It exposes per-session status (thinking / idle / attention / compacting), context window usage, and permission/elicitation requests over D-Bus.
 
 > **Work in progress** — this project is under active development and not ready for daily use yet. Expect breaking changes.
 
@@ -93,15 +93,15 @@ Make sure `~/.cargo/bin` is in your `$PATH`, or use full paths.
 
 | Method | Signature | Args | Description |
 |--------|-----------|------|-------------|
-| `RespondToElicitation` | `ss` | `session_id`, `answer` | Called by the AGS widget when the user responds to a permission or elicitation popup |
+| `RespondToElicitation` | `ss` | `session_id`, `answer` | Sends a response back to a pending permission or elicitation request |
 
 ### Signals
 
 | Signal | Signature | Args | Description |
 |--------|-----------|------|-------------|
 | `StatusChanged` | `ssds` | `session_id`, `state`, `context_pct`, `model_name` | Emitted on every state change (thinking, idle, attention, compacting, etc.) |
-| `ElicitationRequested` | `ssas` | `session_id`, `prompt`, `options` | Emitted when Claude Code needs user input; the widget should show a popup with the given options |
-| `SessionRemoved` | `s` | `session_id` | Emitted when a session ends; the widget should remove the corresponding indicator |
+| `ElicitationRequested` | `ssas` | `session_id`, `prompt`, `options` | Emitted when Claude Code needs user input |
+| `SessionRemoved` | `s` | `session_id` | Emitted when a session ends |
 
 ### Introspect
 
