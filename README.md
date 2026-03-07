@@ -111,10 +111,10 @@ busctl --user introspect com.anthropic.ClaudeCode /com/anthropic/ClaudeCode com.
 
 ## States
 
-| State | Trigger | Icon |
-|-------|---------|------|
-| `no-session` | No active session | `smart_toy` |
-| `thinking` | SessionStart / UserPromptSubmit | `psychology` |
-| `idle` | Stop hook | `smart_toy` |
-| `attention` | TaskCompleted / Notification / elicitation | `notification_important` |
-| `compacting` | PreCompact hook | `compress` |
+| State | Trigger |
+|-------|---------|
+| `no-session` | No active session |
+| `thinking` | SessionStart / UserPromptSubmit |
+| `idle` | Stop hook |
+| `attention` | TaskCompleted / Notification / elicitation |
+| `compacting` | PreCompact hook |
