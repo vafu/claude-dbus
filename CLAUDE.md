@@ -140,6 +140,9 @@ Must use `hookSpecificOutput` wrapper — plain `{"decision":...}` does NOT work
 - Server: `read_to_end` (waits for SHUT_WR EOF), processes, writes response if blocking, closes
 - Client: `read_to_string` to get response
 
+### Keeping README in sync
+When changing the D-Bus interface (methods, signals, bus name, object path, or interface name in `src/dbus.rs`), always update the "D-Bus Interface" section in `README.md` to match.
+
 ### State management
 - Save `pre_attention_state` before setting "attention"
 - `PostToolUse` hook restores state — covers both widget click and terminal answer

@@ -2,6 +2,8 @@
 
 A Rust D-Bus service that bridges [Claude Code](https://claude.ai/claude-code) hooks to an AGS/GTK4 bar widget. It shows per-session status (thinking / idle / attention / compacting), context window usage, and routes permission/elicitation popups to the bar.
 
+> **Work in progress** — this project is under active development and not ready for daily use yet. Expect breaking changes.
+
 ## How it works
 
 ```
@@ -80,6 +82,32 @@ Add to `~/.claude/settings.json`:
 ```
 
 Make sure `~/.cargo/bin` is in your `$PATH`, or use full paths.
+
+## D-Bus Interface
+
+**Bus name:** `com.anthropic.ClaudeCode`
+**Object path:** `/com/anthropic/ClaudeCode`
+**Interface:** `com.anthropic.ClaudeCode1`
+
+### Methods
+
+| Method | Signature | Args | Description |
+|--------|-----------|------|-------------|
+| `RespondToElicitation` | `ss` | `session_id`, `answer` | Called by the AGS widget when the user responds to a permission or elicitation popup |
+
+### Signals
+
+| Signal | Signature | Args | Description |
+|--------|-----------|------|-------------|
+| `StatusChanged` | `ssds` | `session_id`, `state`, `context_pct`, `model_name` | Emitted on every state change (thinking, idle, attention, compacting, etc.) |
+| `ElicitationRequested` | `ssas` | `session_id`, `prompt`, `options` | Emitted when Claude Code needs user input; the widget should show a popup with the given options |
+| `SessionRemoved` | `s` | `session_id` | Emitted when a session ends; the widget should remove the corresponding indicator |
+
+### Introspect
+
+```bash
+busctl --user introspect com.anthropic.ClaudeCode /com/anthropic/ClaudeCode com.anthropic.ClaudeCode1
+```
 
 ## States
 
