@@ -147,5 +147,5 @@ busctl --user call com.anthropic.ClaudeCode /com/anthropic/ClaudeCode org.freede
 
 | Flag | Set by | Cleared by |
 |------|--------|------------|
-| `TaskComplete` | TaskCompleted, Notify | UserPromptSubmit |
+| `TaskComplete` | TaskCompleted | UserPromptSubmit |
 | `RequiresAttention` | PermissionRequest, Elicitation | PostToolUse, user response, UserPromptSubmit |

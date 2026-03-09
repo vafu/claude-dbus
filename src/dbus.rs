@@ -1,3 +1,4 @@
+use tracing::debug;
 use zbus::{interface, object_server::SignalEmitter, zvariant::ObjectPath};
 
 use crate::types::SessionState;
@@ -63,6 +64,12 @@ impl SessionObject {
         prompt: &str,
         options: &[&str],
     ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn notification(
+        emitter: &SignalEmitter<'_>,
+        message: &str,
+    ) -> zbus::Result<()>;
 }
 
 pub fn session_path(session_id: &str) -> ObjectPath<'static> {
@@ -73,6 +80,13 @@ pub fn session_path(session_id: &str) -> ObjectPath<'static> {
     ObjectPath::try_from(format!("/com/anthropic/ClaudeCode/sessions/{}", safe_id)).unwrap()
 }
 
+pub async fn emit_notification(
+    emitter: &SignalEmitter<'_>,
+    message: &str,
+) -> zbus::Result<()> {
+    SessionObject::notification(emitter, message).await
+}
+
 pub async fn emit_elicitation(
     emitter: &SignalEmitter<'_>,
     prompt: &str,
@@ -81,13 +95,25 @@ pub async fn emit_elicitation(
     SessionObject::elicitation_requested(emitter, prompt, options).await
 }
 
+pub async fn create_session(
+    conn: &zbus::Connection,
+    session_id: &str,
+) -> zbus::Result<()> {
+    let path = session_path(session_id);
+    let _ = conn.object_server().at(&path, SessionObject::default()).await;
+    Ok(())
+}
+
 pub async fn update_session(
     conn: &zbus::Connection,
     session_id: &str,
     f: impl FnOnce(&mut SessionObject),
 ) -> zbus::Result<()> {
     let path = session_path(session_id);
-    let _ = conn.object_server().at(&path, SessionObject::default()).await;
+    let created = conn.object_server().at(&path, SessionObject::default()).await.unwrap_or(false);
+    if created {
+        debug!(session_id = %session_id, "auto-created session object");
+    }
     let iface_ref = conn
         .object_server()
         .interface::<_, SessionObject>(&path)
@@ -98,6 +124,15 @@ pub async fn update_session(
     }
     let emitter = iface_ref.signal_emitter();
     let iface = iface_ref.get().await;
+    debug!(
+        session_id = %session_id,
+        state = %iface.state.as_str(),
+        task_complete = %iface.task_complete,
+        requires_attention = %iface.requires_attention,
+        context_pct = %iface.context_pct,
+        model = %iface.model_name,
+        "session updated"
+    );
     iface.state_changed(emitter).await?;
     iface.task_complete_changed(emitter).await?;
     iface.requires_attention_changed(emitter).await?;

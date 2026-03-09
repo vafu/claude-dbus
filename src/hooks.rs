@@ -1,12 +1,14 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 
-use crate::dbus::{SessionObject, emit_elicitation, session_path, update_session};
+use crate::EndedSessions;
+use crate::dbus::{SessionObject, create_session, emit_elicitation, emit_notification, session_path, update_session};
 use crate::types::SessionState;
 
 pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
     conn: zbus::Connection,
+    ended: EndedSessions,
 ) {
     let mut buf = Vec::new();
     if stream.read_to_end(&mut buf).await.is_err() {
@@ -30,9 +32,14 @@ pub async fn handle_hook_connection(
     let session_id = data["session_id"].as_str().unwrap_or("unknown").to_string();
 
     info!(event = %event, session_id = %session_id, "hook received");
+    tracing::debug!(data = %data, "hook data");
 
     match event.as_str() {
         "UpdateState" => {
+            if ended.lock().await.remove(&session_id) {
+                info!(session_id = %session_id, "skipping UpdateState for ended session");
+                return;
+            }
             let ctx_pct = data["context_window"]["used_percentage"]
                 .as_f64()
                 .unwrap_or(0.0);
@@ -50,7 +57,15 @@ pub async fn handle_hook_connection(
             .await;
         }
 
-        "Stop" | "SessionStart" => {
+        "SessionStart" => {
+            let _ = create_session(&conn, &session_id).await;
+            let _ = update_session(&conn, &session_id, |d| {
+                d.state = SessionState::Idle;
+            })
+            .await;
+        }
+
+        "Stop" => {
             let _ = update_session(&conn, &session_id, |d| {
                 d.state = SessionState::Idle;
                 d.requires_attention = false;
@@ -59,6 +74,7 @@ pub async fn handle_hook_connection(
         }
 
         "SessionEnd" => {
+            ended.lock().await.insert(session_id.clone());
             let path = session_path(&session_id);
             let _ = conn
                 .object_server()
@@ -91,14 +107,18 @@ pub async fn handle_hook_connection(
         }
 
         "Notify" => {
-            let message = data["message"].as_str().unwrap_or("");
-            if !message.trim().is_empty() {
-                let _ = update_session(&conn, &session_id, |d| {
-                    d.task_complete = true;
-                })
-                .await;
+            let message = data["message"].as_str().unwrap_or("").to_string();
+            let path = session_path(&session_id);
+            if let Ok(iface_ref) = conn
+                .object_server()
+                .interface::<_, SessionObject>(&path)
+                .await
+            {
+                let emitter = iface_ref.signal_emitter();
+                let _ = emit_notification(emitter, &message).await;
             }
         }
+
 
         "PreCompact" => {
             let _ = update_session(&conn, &session_id, |d| {
@@ -196,10 +216,6 @@ async fn handle_elicitation_event(
     info!(session_id = %session_id, prompt = %prompt, ?options, "elicitation");
 
     let path = session_path(session_id);
-    let _ = conn
-        .object_server()
-        .at(&path, SessionObject::default())
-        .await;
     let iface_ref = match conn
         .object_server()
         .interface::<_, SessionObject>(&path)

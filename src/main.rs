@@ -1,4 +1,8 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use tokio::net::UnixListener;
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::connection;
@@ -6,6 +10,8 @@ use zbus::connection;
 mod dbus;
 mod hooks;
 mod types;
+
+pub type EndedSessions = Arc<Mutex<HashSet<String>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,12 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket_path)?;
     info!(path = %socket_path, "Unix socket listening");
 
+    let ended: EndedSessions = Arc::new(Mutex::new(HashSet::new()));
+
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let conn = conn.clone();
+                let ended = Arc::clone(&ended);
                 tokio::spawn(async move {
-                    hooks::handle_hook_connection(stream, conn).await;
+                    hooks::handle_hook_connection(stream, conn, ended).await;
                 });
             }
             Err(e) => info!("Socket accept error: {}", e),
