@@ -1,25 +1,19 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
-
-#[derive(Clone)]
-pub struct ClaudeData {
-    pub state: String,
-    pub pre_attention_state: String,
-    pub context_used_pct: f64,
-    pub model_name: String,
+#[derive(Clone, Default, PartialEq)]
+pub enum SessionState {
+    #[default]
+    NoSession,
+    Idle,
+    Thinking,
+    Compacting,
 }
 
-impl Default for ClaudeData {
-    fn default() -> Self {
-        Self {
-            state: "no-session".to_string(),
-            pre_attention_state: "thinking".to_string(),
-            context_used_pct: 0.0,
-            model_name: String::new(),
+impl SessionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoSession => "no-session",
+            Self::Idle => "idle",
+            Self::Thinking => "thinking",
+            Self::Compacting => "compacting",
         }
     }
 }
-
-pub type Sessions = Arc<Mutex<HashMap<String, ClaudeData>>>;
-pub type ElicitationTxs = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;

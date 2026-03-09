@@ -1,6 +1,6 @@
 # claude-dbus
 
-A Rust D-Bus service that bridges [Claude Code](https://claude.ai/claude-code) hooks to D-Bus signals. It exposes per-session status (thinking / idle / attention / compacting), context window usage, and permission/elicitation requests over D-Bus.
+A Rust D-Bus service that bridges [Claude Code](https://claude.ai/claude-code) hooks to D-Bus. It exposes per-session objects with properties (state, context usage, model name) and signals for permission/elicitation requests.
 
 > **Work in progress** — this project is under active development and not ready for daily use yet. Expect breaking changes.
 
@@ -15,9 +15,10 @@ claude-hook <EventName>        (CLI — wraps and forwards to socket)
       ▼ $XDG_RUNTIME_DIR/claude-code.sock
 claude-dbus                    (long-running service)
       │
-      ├── D-Bus signals ──────► any subscriber (StatusChanged, SessionRemoved, ElicitationRequested)
+      ├── per-session D-Bus objects with properties (PropertiesChanged)
+      ├── ObjectManager signals (InterfacesAdded/Removed) for session lifecycle
       │
-      └── blocking events ────► waits for RespondToElicitation D-Bus method call
+      └── blocking events ────► waits for RespondToElicitation method call
                                  └──► response written back to Claude Code
 ```
 
@@ -85,36 +86,66 @@ Make sure `~/.cargo/bin` is in your `$PATH`, or use full paths.
 
 ## D-Bus Interface
 
+### Root object
+
 **Bus name:** `com.anthropic.ClaudeCode`
-**Object path:** `/com/anthropic/ClaudeCode`
-**Interface:** `com.anthropic.ClaudeCode1`
+**Path:** `/com/anthropic/ClaudeCode`
+**Interface:** `org.freedesktop.DBus.ObjectManager`
 
-### Methods
+Provides `InterfacesAdded` / `InterfacesRemoved` signals for session lifecycle. Use `GetManagedObjects` to list all active sessions.
 
-| Method | Signature | Args | Description |
-|--------|-----------|------|-------------|
-| `RespondToElicitation` | `ss` | `session_id`, `answer` | Sends a response back to a pending permission or elicitation request |
+### Session objects
 
-### Signals
+**Path:** `/com/anthropic/ClaudeCode/sessions/<session_id>`
+**Interface:** `com.anthropic.ClaudeCode1.Session`
 
-| Signal | Signature | Args | Description |
-|--------|-----------|------|-------------|
-| `StatusChanged` | `ssds` | `session_id`, `state`, `context_pct`, `model_name` | Emitted on every state change (thinking, idle, attention, compacting, etc.) |
-| `ElicitationRequested` | `ssas` | `session_id`, `prompt`, `options` | Emitted when Claude Code needs user input |
-| `SessionRemoved` | `s` | `session_id` | Emitted when a session ends |
+#### Properties (emit `PropertiesChanged`)
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `State` | `s` | `no-session`, `idle`, `thinking`, `compacting` |
+| `TaskComplete` | `b` | `true` when Claude finished a task or sent a notification |
+| `RequiresAttention` | `b` | `true` when user input is needed (permission/elicitation) |
+| `ContextPct` | `d` | Context window usage percentage (0–100) |
+| `ModelName` | `s` | Model display name (e.g. "Opus 4.6") |
+
+#### Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `RespondToElicitation` | `s` | Send answer to a pending permission/elicitation request |
+
+#### Signals
+
+| Signal | Signature | Description |
+|--------|-----------|-------------|
+| `ElicitationRequested` | `sas` | `prompt`, `options` — Claude needs user input |
 
 ### Introspect
 
 ```bash
-busctl --user introspect com.anthropic.ClaudeCode /com/anthropic/ClaudeCode com.anthropic.ClaudeCode1
+# List all sessions
+busctl --user tree com.anthropic.ClaudeCode
+
+# Inspect a session
+busctl --user introspect com.anthropic.ClaudeCode /com/anthropic/ClaudeCode/sessions/<id>
+
+# Get all managed objects
+busctl --user call com.anthropic.ClaudeCode /com/anthropic/ClaudeCode org.freedesktop.DBus.ObjectManager GetManagedObjects
 ```
 
 ## States
 
 | State | Trigger |
 |-------|---------|
-| `no-session` | No active session |
-| `thinking` | SessionStart / UserPromptSubmit |
-| `idle` | Stop hook |
-| `attention` | TaskCompleted / Notification / elicitation |
+| `no-session` | Default before first UpdateState |
+| `idle` | Stop / SessionStart / UpdateState (first seen) |
+| `thinking` | UserPromptSubmit |
 | `compacting` | PreCompact hook |
+
+## Flags
+
+| Flag | Set by | Cleared by |
+|------|--------|------------|
+| `TaskComplete` | TaskCompleted, Notify | UserPromptSubmit |
+| `RequiresAttention` | PermissionRequest, Elicitation | PostToolUse, user response, UserPromptSubmit |

@@ -1,14 +1,11 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
-use zbus::object_server::SignalContext;
 
-use crate::dbus::{ClaudeStatus, restore_after_attention, set_state};
-use crate::types::{ClaudeData, ElicitationTxs, Sessions};
+use crate::dbus::{SessionObject, emit_elicitation, session_path, update_session};
+use crate::types::SessionState;
 
 pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
-    sessions: Sessions,
-    elicitation_txs: ElicitationTxs,
     conn: zbus::Connection,
 ) {
     let mut buf = Vec::new();
@@ -34,88 +31,89 @@ pub async fn handle_hook_connection(
 
     info!(event = %event, session_id = %session_id, "hook received");
 
-    let ctxt = match SignalContext::new(&conn, "/com/anthropic/ClaudeCode") {
-        Ok(c) => c,
-        Err(e) => {
-            info!("Signal context error: {}", e);
-            return;
-        }
-    };
-
     match event.as_str() {
         "UpdateState" => {
-            let mut map = sessions.lock().await;
-            let entry = map
-                .entry(session_id.clone())
-                .or_insert_with(ClaudeData::default);
-            entry.context_used_pct = data["context_window"]["used_percentage"]
+            let ctx_pct = data["context_window"]["used_percentage"]
                 .as_f64()
                 .unwrap_or(0.0);
-            entry.model_name = data["model"]["display_name"]
+            let model = data["model"]["display_name"]
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string();
-            if entry.state == "no-session" {
-                entry.state = "thinking".to_string();
-                entry.pre_attention_state = "thinking".to_string();
-            }
-            let (state, ctx_pct, model_name) = (
-                entry.state.clone(),
-                entry.context_used_pct,
-                entry.model_name.clone(),
-            );
-            drop(map);
-            let _ = ClaudeStatus::status_changed(&ctxt, &session_id, &state, ctx_pct, &model_name)
-                .await;
+            let _ = update_session(&conn, &session_id, |d| {
+                d.context_pct = ctx_pct;
+                d.model_name = model;
+                if d.state == SessionState::NoSession {
+                    d.state = SessionState::Idle;
+                }
+            })
+            .await;
         }
 
-        "Stop" => {
-            let _ = set_state(&sessions, &ctxt, &session_id, "idle").await;
-        }
-
-        "SessionStart" => {
-            let _ = set_state(&sessions, &ctxt, &session_id, "thinking").await;
+        "Stop" | "SessionStart" => {
+            let _ = update_session(&conn, &session_id, |d| {
+                d.state = SessionState::Idle;
+                d.requires_attention = false;
+            })
+            .await;
         }
 
         "SessionEnd" => {
-            sessions.lock().await.remove(&session_id);
-            elicitation_txs.lock().await.remove(&session_id);
-            let _ = ClaudeStatus::session_removed(&ctxt, &session_id).await;
+            let path = session_path(&session_id);
+            let _ = conn
+                .object_server()
+                .remove::<SessionObject, _>(&path)
+                .await;
         }
 
         "TaskCompleted" => {
-            let _ = set_state(&sessions, &ctxt, &session_id, "attention").await;
+            let _ = update_session(&conn, &session_id, |d| {
+                d.task_complete = true;
+            })
+            .await;
         }
 
         "UserPromptSubmit" => {
-            let _ = set_state(&sessions, &ctxt, &session_id, "thinking").await;
+            let _ = update_session(&conn, &session_id, |d| {
+                d.state = SessionState::Thinking;
+                d.task_complete = false;
+                d.requires_attention = false;
+            })
+            .await;
         }
 
         "PostToolUse" => {
-            elicitation_txs.lock().await.remove(&session_id);
-            let _ = restore_after_attention(&sessions, &ctxt, &session_id).await;
+            let _ = update_session(&conn, &session_id, |d| {
+                d.requires_attention = false;
+                d.elicitation_tx = None;
+            })
+            .await;
         }
 
         "Notify" => {
             let message = data["message"].as_str().unwrap_or("");
             if !message.trim().is_empty() {
-                let _ = set_state(&sessions, &ctxt, &session_id, "attention").await;
+                let _ = update_session(&conn, &session_id, |d| {
+                    d.task_complete = true;
+                })
+                .await;
             }
         }
 
         "PreCompact" => {
-            let _ = set_state(&sessions, &ctxt, &session_id, "compacting").await;
+            let _ = update_session(&conn, &session_id, |d| {
+                d.state = SessionState::Compacting;
+                d.requires_attention = false;
+            })
+            .await;
         }
 
         "PermissionRequest" => {
             let response = handle_elicitation_event(
-                data,
+                &conn,
                 &session_id,
                 build_permission_prompt(data),
                 build_permission_options(data),
-                &sessions,
-                &elicitation_txs,
-                &ctxt,
             )
             .await;
             let decision = if response.starts_with("Allow") {
@@ -143,16 +141,8 @@ pub async fn handle_hook_connection(
                         .collect()
                 })
                 .unwrap_or_default();
-            let response = handle_elicitation_event(
-                data,
-                &session_id,
-                prompt,
-                options,
-                &sessions,
-                &elicitation_txs,
-                &ctxt,
-            )
-            .await;
+            let response =
+                handle_elicitation_event(&conn, &session_id, prompt, options).await;
             let _ = stream.write_all(response.as_bytes()).await;
         }
 
@@ -177,8 +167,8 @@ fn build_permission_prompt(data: &serde_json::Value) -> String {
 fn build_permission_options(data: &serde_json::Value) -> Vec<String> {
     let mut options: Vec<String> = data["permission_suggestions"]
         .as_array()
-        .unwrap_or(&vec![])
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|s| {
             let behavior = s["behavior"].as_str()?;
             let dest = s["destination"].as_str().unwrap_or("");
@@ -197,45 +187,55 @@ fn build_permission_options(data: &serde_json::Value) -> Vec<String> {
 }
 
 async fn handle_elicitation_event(
-    _data: &serde_json::Value,
+    conn: &zbus::Connection,
     session_id: &str,
     prompt: String,
     options: Vec<String>,
-    sessions: &Sessions,
-    elicitation_txs: &ElicitationTxs,
-    ctxt: &SignalContext<'_>,
 ) -> String {
     use tokio::sync::oneshot;
     info!(session_id = %session_id, prompt = %prompt, ?options, "elicitation");
 
-    let (tx, rx) = oneshot::channel();
-    elicitation_txs
-        .lock()
+    let path = session_path(session_id);
+    let _ = conn
+        .object_server()
+        .at(&path, SessionObject::default())
+        .await;
+    let iface_ref = match conn
+        .object_server()
+        .interface::<_, SessionObject>(&path)
         .await
-        .insert(session_id.to_string(), tx);
+    {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut iface = iface_ref.get_mut().await;
+        iface.requires_attention = true;
+        iface.elicitation_tx = Some(tx);
+    }
+
+    let emitter = iface_ref.signal_emitter();
+    {
+        let iface = iface_ref.get().await;
+        let _ = iface.requires_attention_changed(emitter).await;
+    }
 
     let option_refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
-    if ClaudeStatus::elicitation_requested(ctxt, session_id, &prompt, &option_refs)
-        .await
-        .is_err()
-    {
-        return String::new();
-    }
-
-    {
-        let mut map = sessions.lock().await;
-        let data = map
-            .entry(session_id.to_string())
-            .or_insert_with(ClaudeData::default);
-        data.pre_attention_state = data.state.clone();
-        data.state = "attention".to_string();
-        let (ctx_pct, model_name) = (data.context_used_pct, data.model_name.clone());
-        drop(map);
-        let _ =
-            ClaudeStatus::status_changed(ctxt, session_id, "attention", ctx_pct, &model_name).await;
-    }
+    let _ = emit_elicitation(emitter, &prompt, &option_refs).await;
 
     let answer = rx.await.unwrap_or_default();
     info!(session_id = %session_id, answer = %answer, "elicitation answered");
+
+    {
+        let mut iface = iface_ref.get_mut().await;
+        iface.requires_attention = false;
+    }
+    {
+        let iface = iface_ref.get().await;
+        let _ = iface.requires_attention_changed(emitter).await;
+    }
+
     answer
 }

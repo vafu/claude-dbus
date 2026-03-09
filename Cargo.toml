@@ -13,9 +13,7 @@ path = "src/claude_hook.rs"
 
 [dependencies]
 zbus = "5.0"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-futures-util = "0.3"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "io-util", "net", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

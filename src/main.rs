@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::connection;
@@ -9,9 +6,6 @@ use zbus::connection;
 mod dbus;
 mod hooks;
 mod types;
-
-use dbus::ClaudeStatus;
-use types::{ElicitationTxs, Sessions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,17 +16,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Claude D-Bus Service...");
 
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let elicitation_txs: ElicitationTxs = Arc::new(Mutex::new(HashMap::new()));
-
-    let server = ClaudeStatus {
-        sessions: Arc::clone(&sessions),
-        elicitation_txs: Arc::clone(&elicitation_txs),
-    };
-
     let conn = connection::Builder::session()?
         .name("com.anthropic.ClaudeCode")?
-        .serve_at("/com/anthropic/ClaudeCode", server)?
+        .serve_at("/com/anthropic/ClaudeCode", zbus::fdo::ObjectManager)?
         .build()
         .await?;
 
@@ -46,23 +32,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket_path)?;
     info!(path = %socket_path, "Unix socket listening");
 
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let sessions = Arc::clone(&sessions);
-                    let elicitation_txs = Arc::clone(&elicitation_txs);
-                    let conn = conn.clone();
-                    tokio::spawn(async move {
-                        hooks::handle_hook_connection(stream, sessions, elicitation_txs, conn)
-                            .await;
-                    });
-                }
-                Err(e) => info!("Socket accept error: {}", e),
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    hooks::handle_hook_connection(stream, conn).await;
+                });
             }
+            Err(e) => info!("Socket accept error: {}", e),
         }
-    });
-
-    std::future::pending::<()>().await;
-    Ok(())
+    }
 }

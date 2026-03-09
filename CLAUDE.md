@@ -5,8 +5,8 @@ A Rust D-Bus service that bridges Claude Code hooks to an AGS/GTK4 bar widget, e
 ## Project Structure
 
 - `src/main.rs` — startup, D-Bus server setup, Unix socket accept loop
-- `src/types.rs` — shared types: `ClaudeData`, `Sessions`, `ElicitationTxs`
-- `src/dbus.rs` — `ClaudeStatus` D-Bus interface, `set_state`, `restore_after_attention`
+- `src/types.rs` — `SessionState` enum
+- `src/dbus.rs` — `SessionObject` D-Bus interface (properties + signals), `update_session` helper
 - `src/hooks.rs` — `handle_hook_connection`, permission/elicitation helpers
 - `src/claude_hook.rs` — CLI binary used as the Claude Code hook for all events
 
@@ -28,34 +28,55 @@ claude-hook <EventName>   (reads stdin JSON, writes {"event":"...", "data":{...}
       ▼
 claude-dbus (Rust service)
       │
-      ├── updates state, emits D-Bus signals → AGS widgets
+      ├── per-session D-Bus objects at /com/anthropic/ClaudeCode/sessions/<id>
+      │     properties: State, TaskComplete, RequiresAttention, ContextPct, ModelName
+      │     auto-emit PropertiesChanged → AGS widgets
+      │
+      ├── ObjectManager at /com/anthropic/ClaudeCode
+      │     auto-emits InterfacesAdded/InterfacesRemoved → AGS session lifecycle
       │
       └── blocking events (PermissionRequest, Elicitation):
             waits for RespondToElicitation D-Bus method call from AGS,
             then writes response back to socket → claude-hook → Claude Code
 ```
 
-Input is exclusively via Unix socket. D-Bus is output-only (signals + one method for AGS responses).
+Input is exclusively via Unix socket. D-Bus is output-only (properties + signals + one method for AGS responses).
 
 ## D-Bus Interface
 
+### Root: ObjectManager
+
 **Name:** `com.anthropic.ClaudeCode`
 **Path:** `/com/anthropic/ClaudeCode`
-**Interface:** `com.anthropic.ClaudeCode1`
 
-### Methods (called by AGS widget)
+Standard `org.freedesktop.DBus.ObjectManager`. Auto-emits `InterfacesAdded`/`InterfacesRemoved` when session objects are created/removed.
 
-| Method | Args | Description |
-|--------|------|-------------|
-| `RespondToElicitation` | `ss session_id answer` | Called by AGS when user clicks a button |
+### Session Objects
 
-### Signals (received by AGS)
+**Path:** `/com/anthropic/ClaudeCode/sessions/<session_id>`
+**Interface:** `com.anthropic.ClaudeCode1.Session`
 
-| Signal | Args | Description |
-|--------|------|-------------|
-| `StatusChanged` | `s session_id, s state, d context_pct, s model_name` | State update |
-| `ElicitationRequested` | `s session_id, s prompt, as options` | Show popup |
-| `SessionRemoved` | `s session_id` | Session ended, remove widget |
+#### Properties (emit PropertiesChanged)
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `State` | `s` | `no-session`, `idle`, `thinking`, `compacting` |
+| `TaskComplete` | `b` | Claude finished a task or sent a notification |
+| `RequiresAttention` | `b` | User input needed (permission/elicitation) |
+| `ContextPct` | `d` | Context window usage percentage |
+| `ModelName` | `s` | Model display name |
+
+#### Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `RespondToElicitation` | `s answer` | Called by AGS when user clicks a button |
+
+#### Signals
+
+| Signal | Signature | Description |
+|--------|-----------|-------------|
+| `ElicitationRequested` | `s prompt, as options` | Show popup |
 
 ## Unix Socket
 
@@ -141,9 +162,12 @@ Must use `hookSpecificOutput` wrapper — plain `{"decision":...}` does NOT work
 - Client: `read_to_string` to get response
 
 ### Keeping README in sync
-When changing the D-Bus interface (methods, signals, bus name, object path, or interface name in `src/dbus.rs`), always update the "D-Bus Interface" section in `README.md` to match.
+When changing the D-Bus interface (properties, methods, signals, bus name, object path, or interface name in `src/dbus.rs`), always update the "D-Bus Interface" section in `README.md` to match.
 
 ### State management
-- Save `pre_attention_state` before setting "attention"
-- `PostToolUse` hook restores state — covers both widget click and terminal answer
-- `SessionRemoved` signal + `HashMap.delete` cleans up ended sessions
+- `State` property reflects the actual session state (idle, thinking, compacting)
+- `TaskComplete` flag is set by TaskCompleted/Notify, cleared by UserPromptSubmit
+- `RequiresAttention` flag is set by blocking events (PermissionRequest/Elicitation), cleared by PostToolUse or user response
+- Session objects are created on first event via `update_session` (which calls `object_server.at()`)
+- Session objects are removed on `SessionEnd` via `object_server.remove()`
+- ObjectManager auto-emits InterfacesAdded/InterfacesRemoved for session lifecycle
