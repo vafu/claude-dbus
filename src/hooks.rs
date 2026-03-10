@@ -112,6 +112,7 @@ pub async fn handle_hook_connection(
 
         "PostToolUse" => {
             let _ = update_session(&conn, &session_id, |d| {
+                d.state = SessionState::Thinking;
                 d.requires_attention = false;
                 d.elicitation_tx = None;
             })
