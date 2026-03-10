@@ -9,6 +9,8 @@ pub struct SessionObject {
     pub requires_attention: bool,
     pub context_pct: f64,
     pub model_name: String,
+    pub cwd: String,
+    pub cost_usd: f64,
     pub elicitation_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
@@ -20,6 +22,8 @@ impl Default for SessionObject {
             requires_attention: false,
             context_pct: 0.0,
             model_name: String::new(),
+            cwd: String::new(),
+            cost_usd: 0.0,
             elicitation_tx: None,
         }
     }
@@ -50,6 +54,16 @@ impl SessionObject {
     #[zbus(property)]
     fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    #[zbus(property)]
+    fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    #[zbus(property)]
+    fn cost_usd(&self) -> f64 {
+        self.cost_usd
     }
 
     async fn respond_to_elicitation(&mut self, answer: &str) {
@@ -138,5 +152,7 @@ pub async fn update_session(
     iface.requires_attention_changed(emitter).await?;
     iface.context_pct_changed(emitter).await?;
     iface.model_name_changed(emitter).await?;
+    iface.cwd_changed(emitter).await?;
+    iface.cost_usd_changed(emitter).await?;
     Ok(())
 }

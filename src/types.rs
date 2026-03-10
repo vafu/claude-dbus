@@ -4,6 +4,7 @@ pub enum SessionState {
     NoSession,
     Idle,
     Thinking,
+    ToolUse,
     Compacting,
 }
 
@@ -13,6 +14,7 @@ impl SessionState {
             Self::NoSession => "no-session",
             Self::Idle => "idle",
             Self::Thinking => "thinking",
+            Self::ToolUse => "tool-use",
             Self::Compacting => "compacting",
         }
     }

@@ -74,6 +74,7 @@ Add to `~/.claude/settings.json`:
     "Notification":      [{"hooks": [{"type": "command", "command": "claude-hook Notify"}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "claude-hook PermissionRequest"}]}],
     "Elicitation":       [{"hooks": [{"type": "command", "command": "claude-hook Elicitation"}]}],
+    "PreToolUse":        [{"hooks": [{"type": "command", "command": "claude-hook PreToolUse"}]}],
     "PostToolUse":       [{"hooks": [{"type": "command", "command": "claude-hook PostToolUse"}]}],
     "TaskCompleted":     [{"hooks": [{"type": "command", "command": "claude-hook TaskCompleted"}]}],
     "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "claude-hook UserPromptSubmit"}]}],
@@ -103,11 +104,13 @@ Provides `InterfacesAdded` / `InterfacesRemoved` signals for session lifecycle. 
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `State` | `s` | `no-session`, `idle`, `thinking`, `compacting` |
+| `State` | `s` | `no-session`, `idle`, `thinking`, `tool-use`, `compacting` |
 | `TaskComplete` | `b` | `true` when Claude finished a task or sent a notification |
 | `RequiresAttention` | `b` | `true` when user input is needed (permission/elicitation) |
 | `ContextPct` | `d` | Context window usage percentage (0–100) |
 | `ModelName` | `s` | Model display name (e.g. "Opus 4.6") |
+| `Cwd` | `s` | Working directory |
+| `CostUsd` | `d` | Total API cost in USD |
 
 #### Methods
 
@@ -120,6 +123,7 @@ Provides `InterfacesAdded` / `InterfacesRemoved` signals for session lifecycle. 
 | Signal | Signature | Description |
 |--------|-----------|-------------|
 | `ElicitationRequested` | `sas` | `prompt`, `options` — Claude needs user input |
+| `Notification` | `s` | `message` — notification from Claude |
 
 ### Introspect
 
@@ -141,6 +145,7 @@ busctl --user call com.anthropic.ClaudeCode /com/anthropic/ClaudeCode org.freede
 | `no-session` | Default before first UpdateState |
 | `idle` | Stop / SessionStart / UpdateState (first seen) |
 | `thinking` | UserPromptSubmit |
+| `tool-use` | PreToolUse |
 | `compacting` | PreCompact hook |
 
 ## Flags

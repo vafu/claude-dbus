@@ -47,9 +47,14 @@ pub async fn handle_hook_connection(
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string();
+            let cwd = data["cwd"].as_str().unwrap_or("").to_string();
+            let cost_usd = data["cost"]["total_cost_usd"].as_f64().unwrap_or(0.0);
             let _ = update_session(&conn, &session_id, |d| {
                 d.context_pct = ctx_pct;
                 d.model_name = model;
+                d.cwd = cwd;
+                d.cost_usd = cost_usd;
+                d.requires_attention = false;
                 if d.state == SessionState::NoSession {
                     d.state = SessionState::Idle;
                 }
@@ -94,6 +99,13 @@ pub async fn handle_hook_connection(
                 d.state = SessionState::Thinking;
                 d.task_complete = false;
                 d.requires_attention = false;
+            })
+            .await;
+        }
+
+        "PreToolUse" => {
+            let _ = update_session(&conn, &session_id, |d| {
+                d.state = SessionState::ToolUse;
             })
             .await;
         }

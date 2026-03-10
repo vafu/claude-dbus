@@ -29,7 +29,7 @@ claude-hook <EventName>   (reads stdin JSON, writes {"event":"...", "data":{...}
 claude-dbus (Rust service)
       │
       ├── per-session D-Bus objects at /com/anthropic/ClaudeCode/sessions/<id>
-      │     properties: State, TaskComplete, RequiresAttention, ContextPct, ModelName
+      │     properties: State, TaskComplete, RequiresAttention, ContextPct, ModelName, Cwd, CostUsd
       │     auto-emit PropertiesChanged → AGS widgets
       │
       ├── ObjectManager at /com/anthropic/ClaudeCode
@@ -65,6 +65,8 @@ Standard `org.freedesktop.DBus.ObjectManager`. Auto-emits `InterfacesAdded`/`Int
 | `RequiresAttention` | `b` | User input needed (permission/elicitation) |
 | `ContextPct` | `d` | Context window usage percentage |
 | `ModelName` | `s` | Model display name |
+| `Cwd` | `s` | Working directory |
+| `CostUsd` | `d` | Total API cost in USD |
 
 #### Methods
 
@@ -77,6 +79,7 @@ Standard `org.freedesktop.DBus.ObjectManager`. Auto-emits `InterfacesAdded`/`Int
 | Signal | Signature | Description |
 |--------|-----------|-------------|
 | `ElicitationRequested` | `s prompt, as options` | Show popup |
+| `Notification` | `s message` | Notification from Claude |
 
 ## Unix Socket
 
