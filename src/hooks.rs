@@ -54,7 +54,6 @@ pub async fn handle_hook_connection(
                 d.model_name = model;
                 d.cwd = cwd;
                 d.cost_usd = cost_usd;
-                d.requires_attention = false;
                 if d.state == SessionState::NoSession {
                     d.state = SessionState::Idle;
                 }
