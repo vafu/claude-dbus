@@ -67,8 +67,10 @@ impl SessionObject {
     }
 
     async fn respond_to_elicitation(&mut self, answer: &str) {
-        if let Some(tx) = self.elicitation_tx.take() {
-            let _ = tx.send(answer.to_string());
+        if !answer.is_empty() {
+            if let Some(tx) = self.elicitation_tx.take() {
+                let _ = tx.send(answer.to_string());
+            }
         }
     }
 
