@@ -4,6 +4,7 @@ use zbus::{interface, object_server::SignalEmitter, zvariant::ObjectPath};
 use crate::types::SessionState;
 
 pub struct SessionObject {
+    pub agent_name: String,
     pub state: SessionState,
     pub task_complete: bool,
     pub requires_attention: bool,
@@ -11,12 +12,15 @@ pub struct SessionObject {
     pub model_name: String,
     pub cwd: String,
     pub cost_usd: f64,
+    pub pending_prompt: String,
+    pub pending_options: Vec<String>,
     pub elicitation_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 impl Default for SessionObject {
     fn default() -> Self {
         Self {
+            agent_name: String::new(),
             state: SessionState::NoSession,
             task_complete: false,
             requires_attention: false,
@@ -24,13 +28,29 @@ impl Default for SessionObject {
             model_name: String::new(),
             cwd: String::new(),
             cost_usd: 0.0,
+            pending_prompt: String::new(),
+            pending_options: Vec::new(),
             elicitation_tx: None,
         }
     }
 }
 
-#[interface(name = "com.anthropic.ClaudeCode1.Session")]
 impl SessionObject {
+    pub fn new(agent_name: &str) -> Self {
+        Self {
+            agent_name: agent_name.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+#[interface(name = "io.github.AgentDBus1.Session")]
+impl SessionObject {
+    #[zbus(property)]
+    fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+
     #[zbus(property)]
     fn state(&self) -> &str {
         self.state.as_str()
@@ -66,6 +86,16 @@ impl SessionObject {
         self.cost_usd
     }
 
+    #[zbus(property)]
+    fn pending_prompt(&self) -> &str {
+        &self.pending_prompt
+    }
+
+    #[zbus(property)]
+    fn pending_options(&self) -> Vec<&str> {
+        self.pending_options.iter().map(String::as_str).collect()
+    }
+
     async fn respond_to_elicitation(&mut self, answer: &str) {
         if !answer.is_empty() {
             if let Some(tx) = self.elicitation_tx.take() {
@@ -82,24 +112,38 @@ impl SessionObject {
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn notification(
-        emitter: &SignalEmitter<'_>,
-        message: &str,
-    ) -> zbus::Result<()>;
+    async fn notification(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
 }
 
-pub fn session_path(session_id: &str) -> ObjectPath<'static> {
-    let safe_id: String = session_id
+fn safe_path_segment(value: &str) -> String {
+    let safe: String = value
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    ObjectPath::try_from(format!("/com/anthropic/ClaudeCode/sessions/{}", safe_id)).unwrap()
+    if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
 }
 
-pub async fn emit_notification(
-    emitter: &SignalEmitter<'_>,
-    message: &str,
-) -> zbus::Result<()> {
+pub fn session_path(agent_name: &str, session_id: &str) -> ObjectPath<'static> {
+    let safe_agent = safe_path_segment(agent_name);
+    let safe_id = safe_path_segment(session_id);
+    ObjectPath::try_from(format!(
+        "/io/github/AgentDBus/sessions/{}/{}",
+        safe_agent, safe_id
+    ))
+    .unwrap()
+}
+
+pub async fn emit_notification(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()> {
     SessionObject::notification(emitter, message).await
 }
 
@@ -113,20 +157,29 @@ pub async fn emit_elicitation(
 
 pub async fn create_session(
     conn: &zbus::Connection,
+    agent_name: &str,
     session_id: &str,
 ) -> zbus::Result<()> {
-    let path = session_path(session_id);
-    let _ = conn.object_server().at(&path, SessionObject::default()).await;
+    let path = session_path(agent_name, session_id);
+    let _ = conn
+        .object_server()
+        .at(&path, SessionObject::new(agent_name))
+        .await;
     Ok(())
 }
 
 pub async fn update_session(
     conn: &zbus::Connection,
+    agent_name: &str,
     session_id: &str,
     f: impl FnOnce(&mut SessionObject),
 ) -> zbus::Result<()> {
-    let path = session_path(session_id);
-    let created = conn.object_server().at(&path, SessionObject::default()).await.unwrap_or(false);
+    let path = session_path(agent_name, session_id);
+    let created = conn
+        .object_server()
+        .at(&path, SessionObject::new(agent_name))
+        .await
+        .unwrap_or(false);
     if created {
         debug!(session_id = %session_id, "auto-created session object");
     }
@@ -136,6 +189,7 @@ pub async fn update_session(
         .await?;
     {
         let mut iface = iface_ref.get_mut().await;
+        iface.agent_name = agent_name.to_string();
         f(&mut iface);
     }
     let emitter = iface_ref.signal_emitter();
@@ -149,6 +203,7 @@ pub async fn update_session(
         model = %iface.model_name,
         "session updated"
     );
+    iface.agent_name_changed(emitter).await?;
     iface.state_changed(emitter).await?;
     iface.task_complete_changed(emitter).await?;
     iface.requires_attention_changed(emitter).await?;
@@ -156,5 +211,7 @@ pub async fn update_session(
     iface.model_name_changed(emitter).await?;
     iface.cwd_changed(emitter).await?;
     iface.cost_usd_changed(emitter).await?;
+    iface.pending_prompt_changed(emitter).await?;
+    iface.pending_options_changed(emitter).await?;
     Ok(())
 }

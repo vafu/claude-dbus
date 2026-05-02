@@ -1,15 +1,19 @@
 [package]
-name = "claude-dbus"
+name = "agent-dbus"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "claude-dbus"
+name = "agent-dbus"
 path = "src/main.rs"
 
 [[bin]]
-name = "claude-hook"
-path = "src/claude_hook.rs"
+name = "agent-hook"
+path = "src/agent_hook.rs"
+
+[[bin]]
+name = "agent-respond"
+path = "src/agent_respond.rs"
 
 [dependencies]
 zbus = "5.0"

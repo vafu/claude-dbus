@@ -1,53 +1,58 @@
-# claude-dbus
+# agent-dbus
 
-A Rust D-Bus service that bridges [Claude Code](https://claude.ai/claude-code) hooks to D-Bus. It exposes per-session objects with properties (state, context usage, model name) and signals for permission/elicitation requests.
+A Rust D-Bus service that bridges lifecycle hooks from agentic coding tools to D-Bus. It is intentionally tool-agnostic: Claude Code, Codex, or another hook-capable agent can all publish session state through the same service.
 
-> **Work in progress** — this project is under active development and not ready for daily use yet. Expect breaking changes.
+> **Work in progress** - agent hook schemas differ by tool and may change. The bridge keeps a stable D-Bus surface and maps known hook events onto it.
 
 ## How it works
 
 ```
-Claude Code hooks
-      │
-      ▼ stdin JSON
-claude-hook <EventName>        (CLI — wraps and forwards to socket)
-      │
-      ▼ $XDG_RUNTIME_DIR/claude-code.sock
-claude-dbus                    (long-running service)
-      │
-      ├── per-session D-Bus objects with properties (PropertiesChanged)
-      ├── ObjectManager signals (InterfacesAdded/Removed) for session lifecycle
-      │
-      └── blocking events ────► waits for RespondToElicitation method call
-                                 └──► response written back to Claude Code
+Agent lifecycle hooks
+      |
+      v stdin JSON
+agent-hook <agent> <EventName>   (CLI - wraps and forwards to socket)
+      |
+      v $XDG_RUNTIME_DIR/agent-dbus.sock
+agent-dbus                       (long-running service)
+      |
+      +-- per-session D-Bus objects with properties
+      +-- ObjectManager signals for session lifecycle
+      +-- blocking approval/input requests -> waits for RespondToElicitation
 ```
+
+The service stores sessions under both agent name and session id, so `claude` and `codex` sessions can run at the same time without object-path collisions.
 
 ## Requirements
 
-- Rust (stable) — install via [rustup](https://rustup.rs)
-- A running D-Bus session (standard on any modern Linux desktop)
+- Rust stable
+- A running D-Bus session
+- An agent tool that can run command hooks with JSON on stdin
 
-## Build & install
+## Build & Install
 
 ```bash
-git clone <repo>
-cd claude-dbus
 cargo build --release
 cargo install --release --path .
 ```
 
-## Start the service
+This installs:
 
-Run `claude-dbus` before starting Claude Code. With systemd:
+- `agent-dbus` - the long-running D-Bus service
+- `agent-hook` - the command invoked by agent hooks
+- `agent-respond` - a terminal helper for answering pending requests
+
+## Start The Service
+
+Run `agent-dbus` before starting your agent tool. With systemd:
 
 ```ini
-# ~/.config/systemd/user/claude-dbus.service
+# ~/.config/systemd/user/agent-dbus.service
 [Unit]
-Description=Claude Code D-Bus bridge
+Description=Agent D-Bus bridge
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=%h/.cargo/bin/claude-dbus
+ExecStart=%h/.cargo/bin/agent-dbus
 Restart=on-failure
 
 [Install]
@@ -55,102 +60,160 @@ WantedBy=graphical-session.target
 ```
 
 ```bash
-systemctl --user enable --now claude-dbus
+systemctl --user enable --now agent-dbus
 ```
 
-Or just run it in a terminal: `claude-dbus &`
+Or run it in a terminal:
 
-## Configure Claude Code hooks
+```bash
+agent-dbus
+```
 
-Add to `~/.claude/settings.json`:
+## Hook CLI
+
+Use:
+
+```bash
+agent-hook <agent-name> <EventName>
+```
+
+Examples:
+
+```bash
+agent-hook codex Stop
+agent-hook claude PermissionRequest
+```
+
+If `<agent-name>` is omitted, `agent-hook` uses `$AGENT_DBUS_AGENT`, or `agent` when the environment variable is unset.
+
+The socket message format is:
+
+```json
+{"agent":"codex","event":"Stop","data":{ "...": "agent hook input" }}
+```
+
+## Answer From A Terminal
+
+If the UI is unavailable, answer a pending request directly:
+
+```bash
+agent-respond <agent-name> <session-id> "Allow"
+agent-respond codex 019dea3f-6d06-79b3-96c5-35f0e602c169 "Deny"
+```
+
+The session id is the original hook `session_id`; `agent-respond` applies the same D-Bus path escaping as the service.
+
+## Configure Codex Hooks
+
+Enable hooks in `~/.codex/config.toml`:
+
+```toml
+[features]
+codex_hooks = true
+```
+
+Add hooks to `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`:
 
 ```json
 {
-  "statusLine": {"type": "command", "command": "claude-hook UpdateState"},
   "hooks": {
-    "Stop":              [{"hooks": [{"type": "command", "command": "claude-hook Stop"}]}],
-    "SessionStart":      [{"hooks": [{"type": "command", "command": "claude-hook SessionStart"}]}],
-    "SessionEnd":        [{"hooks": [{"type": "command", "command": "claude-hook SessionEnd"}]}],
-    "Notification":      [{"hooks": [{"type": "command", "command": "claude-hook Notify"}]}],
-    "PermissionRequest": [{"hooks": [{"type": "command", "command": "claude-hook PermissionRequest"}]}],
-    "Elicitation":       [{"hooks": [{"type": "command", "command": "claude-hook Elicitation"}]}],
-    "PreToolUse":        [{"hooks": [{"type": "command", "command": "claude-hook PreToolUse"}]}],
-    "PostToolUse":       [{"hooks": [{"type": "command", "command": "claude-hook PostToolUse"}]}],
-    "TaskCompleted":     [{"hooks": [{"type": "command", "command": "claude-hook TaskCompleted"}]}],
-    "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "claude-hook UserPromptSubmit"}]}],
-    "PreCompact":        [{"hooks": [{"type": "command", "command": "claude-hook PreCompact"}]}]
+    "SessionStart": [{"hooks": [{"type": "command", "command": "agent-hook codex SessionStart"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "agent-hook codex UserPromptSubmit"}]}],
+    "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook codex PreToolUse"}]}],
+    "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook codex PermissionRequest"}]}],
+    "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook codex PostToolUse"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "agent-hook codex Stop"}]}]
   }
 }
 ```
 
-Make sure `~/.cargo/bin` is in your `$PATH`, or use full paths.
+## Configure Claude Code Hooks
+
+Add hooks to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {"type": "command", "command": "agent-hook claude UpdateState"},
+  "hooks": {
+    "Stop":              [{"hooks": [{"type": "command", "command": "agent-hook claude Stop"}]}],
+    "SessionStart":      [{"hooks": [{"type": "command", "command": "agent-hook claude SessionStart"}]}],
+    "SessionEnd":        [{"hooks": [{"type": "command", "command": "agent-hook claude SessionEnd"}]}],
+    "Notification":      [{"hooks": [{"type": "command", "command": "agent-hook claude Notification"}]}],
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "agent-hook claude PermissionRequest"}]}],
+    "Elicitation":       [{"hooks": [{"type": "command", "command": "agent-hook claude Elicitation"}]}],
+    "PreToolUse":        [{"hooks": [{"type": "command", "command": "agent-hook claude PreToolUse"}]}],
+    "PostToolUse":       [{"hooks": [{"type": "command", "command": "agent-hook claude PostToolUse"}]}],
+    "TaskCompleted":     [{"hooks": [{"type": "command", "command": "agent-hook claude TaskCompleted"}]}],
+    "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "agent-hook claude UserPromptSubmit"}]}],
+    "PreCompact":        [{"hooks": [{"type": "command", "command": "agent-hook claude PreCompact"}]}]
+  }
+}
+```
 
 ## D-Bus Interface
 
-### Root object
+### Root Object
 
-**Bus name:** `com.anthropic.ClaudeCode`
-**Path:** `/com/anthropic/ClaudeCode`
+**Bus name:** `io.github.AgentDBus`
+**Path:** `/io/github/AgentDBus`
 **Interface:** `org.freedesktop.DBus.ObjectManager`
 
-Provides `InterfacesAdded` / `InterfacesRemoved` signals for session lifecycle. Use `GetManagedObjects` to list all active sessions.
+Use `GetManagedObjects` to list all active sessions.
 
-### Session objects
+### Session Objects
 
-**Path:** `/com/anthropic/ClaudeCode/sessions/<session_id>`
-**Interface:** `com.anthropic.ClaudeCode1.Session`
+**Path:** `/io/github/AgentDBus/sessions/<agent_name>/<session_id>`
+**Interface:** `io.github.AgentDBus1.Session`
 
-#### Properties (emit `PropertiesChanged`)
+#### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
+| `AgentName` | `s` | Agent backend name, such as `codex` or `claude` |
 | `State` | `s` | `no-session`, `idle`, `thinking`, `tool-use`, `compacting` |
-| `TaskComplete` | `b` | `true` when Claude finished a task or sent a notification |
-| `RequiresAttention` | `b` | `true` when user input is needed (permission/elicitation) |
-| `ContextPct` | `d` | Context window usage percentage (0–100) |
-| `ModelName` | `s` | Model display name (e.g. "Opus 4.6") |
+| `TaskComplete` | `b` | `true` when the current task/turn completes |
+| `RequiresAttention` | `b` | `true` when an approval/input request is waiting |
+| `ContextPct` | `d` | Context window usage percentage when supplied by input |
+| `ModelName` | `s` | Active model slug or display name |
 | `Cwd` | `s` | Working directory |
-| `CostUsd` | `d` | Total API cost in USD |
+| `CostUsd` | `d` | Total API cost when supplied by input |
+| `PendingPrompt` | `s` | Prompt for the current pending request |
+| `PendingOptions` | `as` | Options for the current pending request |
 
 #### Methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `RespondToElicitation` | `s` | Send answer to a pending permission/elicitation request |
+| `RespondToElicitation` | `s` | Send answer to a pending approval/input request |
 
 #### Signals
 
 | Signal | Signature | Description |
 |--------|-----------|-------------|
-| `ElicitationRequested` | `sas` | `prompt`, `options` — Claude needs user input |
-| `Notification` | `s` | `message` — notification from Claude |
+| `ElicitationRequested` | `sas` | `prompt`, `options` - agent needs user input |
+| `Notification` | `s` | `message` - notification from a compatible hook |
 
 ### Introspect
 
 ```bash
-# List all sessions
-busctl --user tree com.anthropic.ClaudeCode
-
-# Inspect a session
-busctl --user introspect com.anthropic.ClaudeCode /com/anthropic/ClaudeCode/sessions/<id>
-
-# Get all managed objects
-busctl --user call com.anthropic.ClaudeCode /com/anthropic/ClaudeCode org.freedesktop.DBus.ObjectManager GetManagedObjects
+busctl --user tree io.github.AgentDBus
+busctl --user introspect io.github.AgentDBus /io/github/AgentDBus/sessions/codex/<id>
+busctl --user call io.github.AgentDBus /io/github/AgentDBus org.freedesktop.DBus.ObjectManager GetManagedObjects
 ```
 
 ## States
 
 | State | Trigger |
 |-------|---------|
-| `no-session` | Default before first UpdateState |
-| `idle` | Stop / SessionStart / UpdateState (first seen) |
-| `thinking` | UserPromptSubmit |
-| `tool-use` | PreToolUse |
-| `compacting` | PreCompact hook |
+| `no-session` | Default before first event |
+| `idle` | `SessionStart`, `Stop`, or first status update |
+| `thinking` | `UserPromptSubmit` or `PostToolUse` |
+| `tool-use` | `PreToolUse` |
+| `compacting` | `PreCompact` |
 
 ## Flags
 
 | Flag | Set by | Cleared by |
 |------|--------|------------|
-| `TaskComplete` | TaskCompleted | UserPromptSubmit |
-| `RequiresAttention` | PermissionRequest, Elicitation | PostToolUse, user response, UserPromptSubmit |
+| `TaskComplete` | `Stop`, `TaskCompleted` | `SessionStart`, `UserPromptSubmit` |
+| `RequiresAttention` | `PermissionRequest`, `Elicitation` | `PostToolUse`, user response, `UserPromptSubmit` |
