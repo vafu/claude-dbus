@@ -177,6 +177,10 @@ Use `GetManagedObjects` to list all active sessions.
 | `ModelName` | `s` | Active model slug or display name |
 | `Cwd` | `s` | Working directory |
 | `CostUsd` | `d` | Total API cost when supplied by input |
+| `FiveHourUsagePct` | `d` | Current 5-hour usage percentage, when available |
+| `FiveHourResetsAt` | `t` | Unix timestamp for the 5-hour usage reset |
+| `SevenDayUsagePct` | `d` | Current 7-day usage percentage, when available |
+| `SevenDayResetsAt` | `t` | Unix timestamp for the 7-day usage reset |
 | `PendingPrompt` | `s` | Prompt for the current pending request |
 | `PendingOptions` | `as` | Options for the current pending request |
 

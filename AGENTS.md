@@ -30,7 +30,7 @@ agent-hook <agent> <EventName>   (reads stdin JSON, writes {"agent":"...", "even
 agent-dbus
       |
       +-- per-session D-Bus objects at /io/github/AgentDBus/sessions/<agent>/<id>
-      |     properties: AgentName, State, TaskComplete, RequiresAttention, ContextPct, ModelName, Cwd, CostUsd
+      |     properties: AgentName, State, TaskComplete, RequiresAttention, ContextPct, ModelName, Cwd, CostUsd, usage limits
       |
       +-- ObjectManager at /io/github/AgentDBus
       |
@@ -65,6 +65,10 @@ Input is exclusively via Unix socket. D-Bus is output-only, except for `RespondT
 | `ModelName` | `s` | Model slug/display name |
 | `Cwd` | `s` | Working directory |
 | `CostUsd` | `d` | Total API cost, when available |
+| `FiveHourUsagePct` | `d` | Current 5-hour usage percentage, when available |
+| `FiveHourResetsAt` | `t` | Unix timestamp for the 5-hour usage reset |
+| `SevenDayUsagePct` | `d` | Current 7-day usage percentage, when available |
+| `SevenDayResetsAt` | `t` | Unix timestamp for the 7-day usage reset |
 | `PendingPrompt` | `s` | Prompt for the current pending request |
 | `PendingOptions` | `as` | Options for the current pending request |
 

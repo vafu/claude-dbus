@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 
@@ -68,6 +70,7 @@ pub async fn handle_hook_connection(
                 d.model_name = model;
                 d.cwd = cwd;
                 d.cost_usd = cost_usd;
+                apply_usage_limits(d, &agent_name, &session_id, data);
                 if d.state == SessionState::NoSession {
                     d.state = SessionState::Idle;
                 }
@@ -81,6 +84,7 @@ pub async fn handle_hook_connection(
                 d.state = SessionState::Idle;
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                apply_usage_limits(d, &agent_name, &session_id, data);
                 d.task_complete = false;
                 d.requires_attention = false;
             })
@@ -94,6 +98,7 @@ pub async fn handle_hook_connection(
                 d.requires_attention = false;
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                apply_usage_limits(d, &agent_name, &session_id, data);
             })
             .await;
         }
@@ -123,6 +128,7 @@ pub async fn handle_hook_connection(
                 d.pending_options.clear();
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                apply_usage_limits(d, &agent_name, &session_id, data);
             })
             .await;
         }
@@ -132,6 +138,7 @@ pub async fn handle_hook_connection(
                 d.state = SessionState::ToolUse;
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                apply_usage_limits(d, &agent_name, &session_id, data);
             })
             .await;
         }
@@ -145,6 +152,7 @@ pub async fn handle_hook_connection(
                 d.elicitation_tx = None;
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                apply_usage_limits(d, &agent_name, &session_id, data);
             })
             .await;
         }
@@ -176,6 +184,7 @@ pub async fn handle_hook_connection(
             let _ = update_session(&conn, &agent_name, &session_id, |d| {
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                apply_usage_limits(d, &agent_name, &session_id, data);
             })
             .await;
             let response = handle_elicitation_event(
@@ -268,6 +277,130 @@ fn model_name(data: &serde_json::Value) -> String {
 
 fn session_key(agent_name: &str, session_id: &str) -> String {
     format!("{}:{}", agent_name, session_id)
+}
+
+fn apply_usage_limits(
+    session: &mut SessionObject,
+    agent_name: &str,
+    session_id: &str,
+    data: &serde_json::Value,
+) {
+    let fallback = if agent_name == "codex" {
+        codex_usage_limits(session_id)
+    } else {
+        None
+    };
+
+    if let Some((pct, resets_at)) = usage_limit(data, "primary")
+        .or_else(|| usage_limit(data, "five_hour"))
+        .or_else(|| usage_limit(data, "fiveHour"))
+        .or_else(|| usage_limit(data, "5h"))
+        .or(fallback.as_ref().and_then(|limits| limits.five_hour))
+    {
+        session.five_hour_usage_pct = pct;
+        session.five_hour_resets_at = resets_at;
+    }
+
+    if let Some((pct, resets_at)) = usage_limit(data, "secondary")
+        .or_else(|| usage_limit(data, "seven_day"))
+        .or_else(|| usage_limit(data, "sevenDay"))
+        .or_else(|| usage_limit(data, "7d"))
+        .or(fallback.as_ref().and_then(|limits| limits.seven_day))
+    {
+        session.seven_day_usage_pct = pct;
+        session.seven_day_resets_at = resets_at;
+    }
+}
+
+fn usage_limit(data: &serde_json::Value, key: &str) -> Option<(f64, u64)> {
+    let limit = data["rate_limits"][key]
+        .as_object()
+        .map(|_| &data["rate_limits"][key])
+        .or_else(|| data["usage"][key].as_object().map(|_| &data["usage"][key]))
+        .or_else(|| {
+            data["limits"][key]
+                .as_object()
+                .map(|_| &data["limits"][key])
+        })?;
+
+    let pct = limit["used_percent"]
+        .as_f64()
+        .or_else(|| limit["usage_percent"].as_f64())
+        .or_else(|| limit["used_pct"].as_f64())
+        .or_else(|| limit["percent"].as_f64())?;
+    let resets_at = limit["resets_at"]
+        .as_u64()
+        .or_else(|| limit["reset_at"].as_u64())
+        .or_else(|| limit["reset_time"].as_u64())
+        .unwrap_or(0);
+
+    Some((pct, resets_at))
+}
+
+#[derive(Clone, Copy)]
+struct UsageLimits {
+    five_hour: Option<(f64, u64)>,
+    seven_day: Option<(f64, u64)>,
+}
+
+fn codex_usage_limits(session_id: &str) -> Option<UsageLimits> {
+    let path = codex_session_file(session_id)?;
+    let contents = std::fs::read_to_string(path).ok()?;
+
+    contents.lines().rev().find_map(|line| {
+        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
+        let payload = &entry["payload"];
+        if entry["type"].as_str()? != "event_msg" || payload["type"].as_str()? != "token_count" {
+            return None;
+        }
+
+        let data = serde_json::json!({ "rate_limits": payload["rate_limits"].clone() });
+        Some(UsageLimits {
+            five_hour: usage_limit(&data, "primary"),
+            seven_day: usage_limit(&data, "secondary"),
+        })
+    })
+}
+
+fn codex_session_file(session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let sessions_dir = Path::new(&home).join(".codex/sessions");
+    let mut matches = Vec::new();
+    collect_matching_codex_sessions(&sessions_dir, session_id, &mut matches);
+    matches.into_iter().max_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    })
+}
+
+fn collect_matching_codex_sessions(dir: &Path, session_id: &str, matches: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            collect_matching_codex_sessions(&path, session_id, matches);
+            continue;
+        }
+
+        if file_type.is_file()
+            && path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+        {
+            matches.push(path);
+        }
+    }
 }
 
 async fn handle_elicitation_event(

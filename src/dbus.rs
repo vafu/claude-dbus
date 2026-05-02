@@ -12,6 +12,10 @@ pub struct SessionObject {
     pub model_name: String,
     pub cwd: String,
     pub cost_usd: f64,
+    pub five_hour_usage_pct: f64,
+    pub five_hour_resets_at: u64,
+    pub seven_day_usage_pct: f64,
+    pub seven_day_resets_at: u64,
     pub pending_prompt: String,
     pub pending_options: Vec<String>,
     pub elicitation_tx: Option<tokio::sync::oneshot::Sender<String>>,
@@ -28,6 +32,10 @@ impl Default for SessionObject {
             model_name: String::new(),
             cwd: String::new(),
             cost_usd: 0.0,
+            five_hour_usage_pct: 0.0,
+            five_hour_resets_at: 0,
+            seven_day_usage_pct: 0.0,
+            seven_day_resets_at: 0,
             pending_prompt: String::new(),
             pending_options: Vec::new(),
             elicitation_tx: None,
@@ -84,6 +92,26 @@ impl SessionObject {
     #[zbus(property)]
     fn cost_usd(&self) -> f64 {
         self.cost_usd
+    }
+
+    #[zbus(property)]
+    fn five_hour_usage_pct(&self) -> f64 {
+        self.five_hour_usage_pct
+    }
+
+    #[zbus(property)]
+    fn five_hour_resets_at(&self) -> u64 {
+        self.five_hour_resets_at
+    }
+
+    #[zbus(property)]
+    fn seven_day_usage_pct(&self) -> f64 {
+        self.seven_day_usage_pct
+    }
+
+    #[zbus(property)]
+    fn seven_day_resets_at(&self) -> u64 {
+        self.seven_day_resets_at
     }
 
     #[zbus(property)]
@@ -211,6 +239,10 @@ pub async fn update_session(
     iface.model_name_changed(emitter).await?;
     iface.cwd_changed(emitter).await?;
     iface.cost_usd_changed(emitter).await?;
+    iface.five_hour_usage_pct_changed(emitter).await?;
+    iface.five_hour_resets_at_changed(emitter).await?;
+    iface.seven_day_usage_pct_changed(emitter).await?;
+    iface.seven_day_resets_at_changed(emitter).await?;
     iface.pending_prompt_changed(emitter).await?;
     iface.pending_options_changed(emitter).await?;
     Ok(())
