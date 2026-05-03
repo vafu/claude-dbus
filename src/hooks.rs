@@ -87,6 +87,8 @@ pub async fn handle_hook_connection(
                 apply_usage_limits(d, &agent_name, &session_id, data);
                 d.task_complete = false;
                 d.requires_attention = false;
+                d.pending_prompt.clear();
+                d.pending_options.clear();
             })
             .await;
         }
@@ -96,6 +98,8 @@ pub async fn handle_hook_connection(
                 d.state = SessionState::Idle;
                 d.task_complete = true;
                 d.requires_attention = false;
+                d.pending_prompt.clear();
+                d.pending_options.clear();
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                 apply_usage_limits(d, &agent_name, &session_id, data);
