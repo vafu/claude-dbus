@@ -3,17 +3,18 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 
-use crate::EndedSessions;
 use crate::dbus::{
     SessionObject, create_session, emit_elicitation, emit_notification, session_path,
     update_session,
 };
 use crate::types::SessionState;
+use crate::{ElicitationLocks, EndedSessions};
 
 pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
     conn: zbus::Connection,
     ended: EndedSessions,
+    elicitation_locks: ElicitationLocks,
 ) {
     let mut buf = Vec::new();
     if stream.read_to_end(&mut buf).await.is_err() {
@@ -41,7 +42,6 @@ pub async fn handle_hook_connection(
         .unwrap_or("agent")
         .to_string();
     let session_id = data["session_id"].as_str().unwrap_or("unknown").to_string();
-
     info!(agent = %agent_name, event = %event, session_id = %session_id, "hook received");
     tracing::debug!(data = %data, "hook data");
 
@@ -86,9 +86,7 @@ pub async fn handle_hook_connection(
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                 apply_usage_limits(d, &agent_name, &session_id, data);
                 d.task_complete = false;
-                d.requires_attention = false;
-                d.pending_prompt.clear();
-                d.pending_options.clear();
+                clear_pending_if_not_waiting(d);
             })
             .await;
         }
@@ -97,9 +95,7 @@ pub async fn handle_hook_connection(
             let _ = update_session(&conn, &agent_name, &session_id, |d| {
                 d.state = SessionState::Idle;
                 d.task_complete = true;
-                d.requires_attention = false;
-                d.pending_prompt.clear();
-                d.pending_options.clear();
+                clear_pending_if_not_waiting(d);
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                 apply_usage_limits(d, &agent_name, &session_id, data);
@@ -127,9 +123,7 @@ pub async fn handle_hook_connection(
             let _ = update_session(&conn, &agent_name, &session_id, |d| {
                 d.state = SessionState::Thinking;
                 d.task_complete = false;
-                d.requires_attention = false;
-                d.pending_prompt.clear();
-                d.pending_options.clear();
+                clear_pending_if_not_waiting(d);
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                 apply_usage_limits(d, &agent_name, &session_id, data);
@@ -150,10 +144,7 @@ pub async fn handle_hook_connection(
         "PostToolUse" => {
             let _ = update_session(&conn, &agent_name, &session_id, |d| {
                 d.state = SessionState::Thinking;
-                d.requires_attention = false;
-                d.pending_prompt.clear();
-                d.pending_options.clear();
-                d.elicitation_tx = None;
+                clear_pending_if_not_waiting(d);
                 d.model_name = model_name(data);
                 d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                 apply_usage_limits(d, &agent_name, &session_id, data);
@@ -177,9 +168,7 @@ pub async fn handle_hook_connection(
         "PreCompact" => {
             let _ = update_session(&conn, &agent_name, &session_id, |d| {
                 d.state = SessionState::Compacting;
-                d.requires_attention = false;
-                d.pending_prompt.clear();
-                d.pending_options.clear();
+                clear_pending_if_not_waiting(d);
             })
             .await;
         }
@@ -193,18 +182,18 @@ pub async fn handle_hook_connection(
             .await;
             let response = handle_elicitation_event(
                 &conn,
+                &elicitation_locks,
                 &agent_name,
                 &session_id,
                 build_permission_prompt(data),
                 build_permission_options(data),
             )
             .await;
-            let decision = if response.starts_with("Allow") {
-                r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+            if let Some(decision) = permission_response(&response) {
+                let _ = stream.write_all(decision.as_bytes()).await;
             } else {
-                r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"User denied via popup"}}}"#
-            };
-            let _ = stream.write_all(decision.as_bytes()).await;
+                info!(agent = %agent_name, session_id = %session_id, "permission request ended without an explicit response");
+            }
         }
 
         "Elicitation" => {
@@ -224,8 +213,15 @@ pub async fn handle_hook_connection(
                         .collect()
                 })
                 .unwrap_or_default();
-            let response =
-                handle_elicitation_event(&conn, &agent_name, &session_id, prompt, options).await;
+            let response = handle_elicitation_event(
+                &conn,
+                &elicitation_locks,
+                &agent_name,
+                &session_id,
+                prompt,
+                options,
+            )
+            .await;
             let _ = stream.write_all(response.as_bytes()).await;
         }
 
@@ -269,6 +265,20 @@ fn build_permission_options(data: &serde_json::Value) -> Vec<String> {
     }
     options.push("Deny".to_string());
     options
+}
+
+fn permission_response(answer: &str) -> Option<&'static str> {
+    if answer.starts_with("Allow") {
+        Some(
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
+        )
+    } else if answer.starts_with("Deny") {
+        Some(
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"User denied via popup"}}}"#,
+        )
+    } else {
+        None
+    }
 }
 
 fn model_name(data: &serde_json::Value) -> String {
@@ -409,6 +419,7 @@ fn collect_matching_codex_sessions(dir: &Path, session_id: &str, matches: &mut V
 
 async fn handle_elicitation_event(
     conn: &zbus::Connection,
+    elicitation_locks: &ElicitationLocks,
     agent_name: &str,
     session_id: &str,
     prompt: String,
@@ -416,6 +427,15 @@ async fn handle_elicitation_event(
 ) -> String {
     use tokio::sync::oneshot;
     info!(agent = %agent_name, session_id = %session_id, prompt = %prompt, ?options, "elicitation");
+
+    let session_lock = {
+        let mut locks = elicitation_locks.lock().await;
+        locks
+            .entry(session_key(agent_name, session_id))
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _session_guard = session_lock.lock().await;
 
     let path = session_path(agent_name, session_id);
     let _ = conn
@@ -451,16 +471,26 @@ async fn handle_elicitation_event(
     let option_refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
     let _ = emit_elicitation(emitter, &prompt, &option_refs).await;
 
-    let answer = rx.await.unwrap_or_default();
+    let answer = match rx.await {
+        Ok(answer) => answer,
+        Err(_) => {
+            info!(agent = %agent_name, session_id = %session_id, "elicitation waiter was dropped before an explicit response");
+            String::new()
+        }
+    };
     info!(agent = %agent_name, session_id = %session_id, answer = %answer, "elicitation answered");
 
+    let mut should_clear = false;
     {
         let mut iface = iface_ref.get_mut().await;
-        iface.requires_attention = false;
-        iface.pending_prompt.clear();
-        iface.pending_options.clear();
+        if iface.pending_prompt == prompt && iface.elicitation_tx.is_none() {
+            iface.requires_attention = false;
+            iface.pending_prompt.clear();
+            iface.pending_options.clear();
+            should_clear = true;
+        }
     }
-    {
+    if should_clear {
         let iface = iface_ref.get().await;
         let _ = iface.requires_attention_changed(emitter).await;
         let _ = iface.pending_prompt_changed(emitter).await;
@@ -468,4 +498,12 @@ async fn handle_elicitation_event(
     }
 
     answer
+}
+
+fn clear_pending_if_not_waiting(session: &mut SessionObject) {
+    if session.elicitation_tx.is_none() {
+        session.requires_attention = false;
+        session.pending_prompt.clear();
+        session.pending_options.clear();
+    }
 }

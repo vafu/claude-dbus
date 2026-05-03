@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
@@ -12,6 +12,7 @@ mod hooks;
 mod types;
 
 pub type EndedSessions = Arc<Mutex<HashSet<String>>>;
+pub type ElicitationLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,14 +40,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(path = %socket_path, "Unix socket listening");
 
     let ended: EndedSessions = Arc::new(Mutex::new(HashSet::new()));
+    let elicitation_locks: ElicitationLocks = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let conn = conn.clone();
                 let ended = Arc::clone(&ended);
+                let elicitation_locks = Arc::clone(&elicitation_locks);
                 tokio::spawn(async move {
-                    hooks::handle_hook_connection(stream, conn, ended).await;
+                    hooks::handle_hook_connection(stream, conn, ended, elicitation_locks).await;
                 });
             }
             Err(e) => info!("Socket accept error: {}", e),
