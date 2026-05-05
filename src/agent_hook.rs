@@ -1,6 +1,5 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Component, Path, PathBuf};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,8 +77,6 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
     if !window_id.is_empty() {
         update_locus_window_session_link(&locus, &key, &window_id, remove).await;
     }
-
-    update_locus_project_session_link(&locus, &key, data["cwd"].as_str(), remove).await;
 }
 
 async fn update_locus_window_session_link(
@@ -97,62 +94,6 @@ async fn update_locus_window_session_link(
             .add_link(&source, "agent-session", &target, false)
             .await;
     }
-}
-
-async fn update_locus_project_session_link(
-    locus: &locus::Client<'_>,
-    key: &str,
-    cwd: Option<&str>,
-    remove: bool,
-) {
-    let target = format!("agent-session:{key}");
-    if remove {
-        remove_locus_project_session_links(locus, &target).await;
-        return;
-    }
-
-    let Some(project_root) = cwd.and_then(project_root_for_cwd) else {
-        return;
-    };
-    let Some(source) = ensure_locus_project(locus, &project_root).await else {
-        return;
-    };
-
-    let _ = locus
-        .add_link(&source, "agent-session", &target, false)
-        .await;
-}
-
-async fn remove_locus_project_session_links(locus: &locus::Client<'_>, target: &str) {
-    let Ok(sources) = locus.sources(target, "agent-session").await else {
-        return;
-    };
-
-    for source in sources {
-        if source.starts_with("project:") {
-            let _ = locus.remove_link(&source, "agent-session", target).await;
-        }
-    }
-}
-
-async fn ensure_locus_project(locus: &locus::Client<'_>, path: &Path) -> Option<String> {
-    let path = path.to_str()?;
-    locus
-        .ensure_project_spec(locus::ProjectSpec::new(path))
-        .await
-        .ok()
-        .filter(|subject| !subject.is_empty())
-}
-
-fn project_root_for_cwd(cwd: &str) -> Option<PathBuf> {
-    let proj_dir = PathBuf::from(std::env::var_os("HOME")?).join("proj");
-    let cwd = PathBuf::from(cwd);
-    let relative = cwd.strip_prefix(&proj_dir).ok()?;
-    let Some(Component::Normal(project_name)) = relative.components().next() else {
-        return None;
-    };
-
-    Some(proj_dir.join(project_name))
 }
 
 fn safe_segment(value: &str) -> String {
