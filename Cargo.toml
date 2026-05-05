@@ -16,6 +16,7 @@ name = "agent-respond"
 path = "src/agent_respond.rs"
 
 [dependencies]
+locus = { path = "../locus", default-features = false }
 zbus = "5.0"
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "io-util", "net", "sync"] }

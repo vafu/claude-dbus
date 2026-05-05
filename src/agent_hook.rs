@@ -1,9 +1,9 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (agent, event) = parse_args();
     if event.is_empty() {
         eprintln!("Usage: agent-hook [AgentName] <EventName>");
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data: serde_json::Value =
         serde_json::from_str(stdin_data.trim()).unwrap_or(serde_json::Value::Null);
-    record_session_links_if_present(&agent, &event, &data);
+    record_session_links_if_present(&agent, &event, &data).await;
 
     let msg = serde_json::json!({
         "agent": agent,
@@ -58,82 +58,89 @@ fn parse_args() -> (String, String) {
     }
 }
 
-fn record_session_links_if_present(agent: &str, event: &str, data: &serde_json::Value) {
+async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_json::Value) {
     let session_id = data["session_id"].as_str().unwrap_or("");
     if session_id.is_empty() {
         return;
     }
+
+    let Ok(connection) = zbus::Connection::session().await else {
+        return;
+    };
+    let Ok(locus) = locus::Client::new(&connection).await else {
+        return;
+    };
 
     let key = format!("{}/{}", safe_segment(agent), safe_segment(session_id));
     let remove = event == "SessionEnd";
 
     let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
     if !window_id.is_empty() {
-        update_locus_window_session_link(&key, &window_id, remove);
+        update_locus_window_session_link(&locus, &key, &window_id, remove).await;
     }
 
-    update_locus_project_session_link(&key, data["cwd"].as_str(), remove);
+    update_locus_project_session_link(&locus, &key, data["cwd"].as_str(), remove).await;
 }
 
-fn update_locus_window_session_link(key: &str, window_id: &str, remove: bool) {
+async fn update_locus_window_session_link(
+    locus: &locus::Client<'_>,
+    key: &str,
+    window_id: &str,
+    remove: bool,
+) {
     let source = format!("niri:window:{window_id}");
     let target = format!("agent-session:{key}");
     if remove {
-        run_locusctl(["link", "remove", &source, "agent-session", &target]);
+        let _ = locus.remove_link(&source, "agent-session", &target).await;
     } else {
-        run_locusctl(["link", "add", &source, "agent-session", &target]);
+        let _ = locus
+            .add_link(&source, "agent-session", &target, false)
+            .await;
     }
 }
 
-fn update_locus_project_session_link(key: &str, cwd: Option<&str>, remove: bool) {
+async fn update_locus_project_session_link(
+    locus: &locus::Client<'_>,
+    key: &str,
+    cwd: Option<&str>,
+    remove: bool,
+) {
     let target = format!("agent-session:{key}");
     if remove {
-        remove_locus_project_session_links(&target);
+        remove_locus_project_session_links(locus, &target).await;
         return;
     }
 
     let Some(project_root) = cwd.and_then(project_root_for_cwd) else {
         return;
     };
-    let Some(source) = ensure_locus_project(&project_root) else {
+    let Some(source) = ensure_locus_project(locus, &project_root).await else {
         return;
     };
 
-    run_locusctl(["link", "add", &source, "agent-session", &target]);
+    let _ = locus
+        .add_link(&source, "agent-session", &target, false)
+        .await;
 }
 
-fn remove_locus_project_session_links(target: &str) {
-    let Ok(output) = Command::new(locusctl_command())
-        .args(["link", "sources", target, "agent-session"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+async fn remove_locus_project_session_links(locus: &locus::Client<'_>, target: &str) {
+    let Ok(sources) = locus.sources(target, "agent-session").await else {
         return;
     };
 
-    for source in String::from_utf8_lossy(&output.stdout).lines() {
+    for source in sources {
         if source.starts_with("project:") {
-            run_locusctl(["link", "remove", source, "agent-session", target]);
+            let _ = locus.remove_link(&source, "agent-session", target).await;
         }
     }
 }
 
-fn ensure_locus_project(path: &Path) -> Option<String> {
-    let output = Command::new(locusctl_command())
-        .args(["project", "ensure"])
-        .arg(path)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    String::from_utf8(output.stdout)
+async fn ensure_locus_project(locus: &locus::Client<'_>, path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    locus
+        .ensure_project_spec(locus::ProjectSpec::new(path))
+        .await
         .ok()
-        .map(|subject| subject.trim().to_string())
         .filter(|subject| !subject.is_empty())
 }
 
@@ -146,27 +153,6 @@ fn project_root_for_cwd(cwd: &str) -> Option<PathBuf> {
     };
 
     Some(proj_dir.join(project_name))
-}
-
-fn run_locusctl<const N: usize>(args: [&str; N]) {
-    let _ = Command::new(locusctl_command())
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-fn locusctl_command() -> PathBuf {
-    if let Some(path) = std::env::var_os("LOCUSCTL") {
-        return PathBuf::from(path);
-    }
-
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("locusctl")))
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| PathBuf::from("locusctl"))
 }
 
 fn safe_segment(value: &str) -> String {
