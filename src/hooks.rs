@@ -218,17 +218,7 @@ pub async fn handle_hook_connection(
                 .or_else(|| data["message"].as_str())
                 .unwrap_or("Agent needs input")
                 .to_string();
-            let options: Vec<String> = data["elicitation"]["options"]
-                .as_array()
-                .or_else(|| data["options"].as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| {
-                            v["value"].as_str().or_else(|| v.as_str()).map(String::from)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let options = build_elicitation_options(data);
             let response = handle_elicitation_event(
                 &conn,
                 &elicitation_locks,
@@ -355,12 +345,81 @@ fn build_permission_options(data: &serde_json::Value) -> Vec<String> {
     if options.is_empty() {
         options.push("Allow".to_string());
     }
+    options.push("Always allow".to_string());
     options.push("Deny".to_string());
     options
 }
 
+fn build_elicitation_options(data: &serde_json::Value) -> Vec<String> {
+    let mut options: Vec<String> = data["elicitation"]["options"]
+        .as_array()
+        .or_else(|| data["options"].as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v["value"].as_str().or_else(|| v.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if (supports_always_allow(data) || is_approval_elicitation(&options))
+        && has_allow_option(&options)
+        && !has_always_allow_option(&options)
+    {
+        let insert_at = options
+            .iter()
+            .position(|option| is_decline_option(option))
+            .unwrap_or(options.len());
+        options.insert(insert_at, "Always allow".to_string());
+    }
+
+    options
+}
+
+fn is_approval_elicitation(options: &[String]) -> bool {
+    has_allow_option(options) && options.iter().any(|option| is_decline_option(option))
+}
+
+fn supports_always_allow(data: &serde_json::Value) -> bool {
+    [
+        &data["_meta"]["persist"],
+        &data["elicitation"]["_meta"]["persist"],
+        &data["meta"]["persist"],
+        &data["elicitation"]["meta"]["persist"],
+    ]
+    .iter()
+    .any(|persist| persist_value_includes(persist, "always"))
+}
+
+fn persist_value_includes(value: &serde_json::Value, needle: &str) -> bool {
+    value
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case(needle))
+        || value.as_array().is_some_and(|arr| {
+            arr.iter()
+                .any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(needle)))
+        })
+}
+
+fn has_allow_option(options: &[String]) -> bool {
+    options.iter().any(|option| {
+        let normalized = option.trim().to_ascii_lowercase();
+        normalized == "allow" || normalized == "accept"
+    })
+}
+
+fn has_always_allow_option(options: &[String]) -> bool {
+    options
+        .iter()
+        .any(|option| option.trim().eq_ignore_ascii_case("always allow"))
+}
+
+fn is_decline_option(option: &str) -> bool {
+    let normalized = option.trim().to_ascii_lowercase();
+    normalized == "deny" || normalized == "decline" || normalized == "cancel"
+}
+
 fn permission_response(answer: &str) -> Option<&'static str> {
-    if answer.starts_with("Allow") {
+    if answer.starts_with("Allow") || answer.starts_with("Always allow") {
         Some(
             r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
         )
@@ -597,5 +656,73 @@ fn clear_pending_if_not_waiting(session: &mut SessionObject) {
         session.requires_attention = false;
         session.pending_prompt.clear();
         session.pending_options.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn elicitation_options_include_always_allow_when_persisted_approval_is_supported() {
+        let data = json!({
+            "_meta": {
+                "persist": ["session", "always"]
+            },
+            "elicitation": {
+                "options": ["Allow", "Decline"]
+            }
+        });
+
+        assert_eq!(
+            build_elicitation_options(&data),
+            vec!["Allow", "Always allow", "Decline"]
+        );
+    }
+
+    #[test]
+    fn elicitation_options_include_always_allow_for_approval_choices_without_persist_hint() {
+        let data = json!({
+            "elicitation": {
+                "options": ["Allow", "Decline"]
+            }
+        });
+
+        assert_eq!(
+            build_elicitation_options(&data),
+            vec!["Allow", "Always allow", "Decline"]
+        );
+    }
+
+    #[test]
+    fn elicitation_options_do_not_add_always_allow_to_non_approval_choices() {
+        let data = json!({
+            "elicitation": {
+                "options": ["One", "Two"]
+            }
+        });
+
+        assert_eq!(build_elicitation_options(&data), vec!["One", "Two"]);
+    }
+
+    #[test]
+    fn permission_response_accepts_always_allow() {
+        assert_eq!(
+            permission_response("Always allow"),
+            Some(
+                r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn permission_options_include_always_allow() {
+        let data = json!({});
+
+        assert_eq!(
+            build_permission_options(&data),
+            vec!["Allow", "Always allow", "Deny"]
+        );
     }
 }
