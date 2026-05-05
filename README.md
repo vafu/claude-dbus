@@ -22,6 +22,8 @@ agent-dbus                       (long-running service)
 
 The service stores sessions under both agent name and session id, so `claude` and `codex` sessions can run at the same time without object-path collisions.
 
+Codex does not currently expose a `SessionEnd` command hook. For Codex hook messages, `agent-hook` includes the parent Codex process id and `agent-dbus` removes the session object after that process exits. `Stop` still means turn completion.
+
 ## Requirements
 
 - Rust stable
@@ -126,6 +128,8 @@ Add hooks to `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`:
   }
 }
 ```
+
+Codex session objects are cleaned up automatically when the originating Codex process exits.
 
 ## Configure Claude Code Hooks
 

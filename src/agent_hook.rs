@@ -20,6 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "agent": agent,
         "event": event,
         "data": data,
+        "hook_pid": std::process::id(),
+        "parent_pid": owning_process_pid(),
     });
     let msg_bytes = serde_json::to_vec(&msg)?;
 
@@ -43,6 +45,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn owning_process_pid() -> Option<u32> {
+    let direct_parent = process_parent_pid(std::process::id())?;
+    let mut pid = direct_parent;
+
+    for _ in 0..32 {
+        if process_name(pid)
+            .as_deref()
+            .is_some_and(|name| name.contains("codex"))
+        {
+            return Some(pid);
+        }
+        let Some(parent_pid) = process_parent_pid(pid) else {
+            break;
+        };
+        pid = parent_pid;
+    }
+
+    Some(direct_parent)
+}
+
+fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(&stat).map(|(_, parent_pid)| parent_pid)
+}
+
+fn process_name(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(&stat).map(|(name, _)| name)
+}
+
+fn parse_stat(stat: &str) -> Option<(String, u32)> {
+    let open_paren = stat.find('(')?;
+    let close_paren = stat.rfind(") ")?;
+    let name = stat[open_paren + 1..close_paren].to_string();
+    let mut fields = stat[close_paren + 2..].split_whitespace();
+    fields.next()?;
+    let parent_pid = fields.next()?.parse().ok()?;
+    Some((name, parent_pid))
 }
 
 fn parse_args() -> (String, String) {

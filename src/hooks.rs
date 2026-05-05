@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{Duration, sleep};
 use tracing::info;
 
 use crate::dbus::{
@@ -8,13 +9,14 @@ use crate::dbus::{
     update_session,
 };
 use crate::types::SessionState;
-use crate::{ElicitationLocks, EndedSessions};
+use crate::{CodexSessionParents, ElicitationLocks, EndedSessions};
 
 pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
     conn: zbus::Connection,
     ended: EndedSessions,
     elicitation_locks: ElicitationLocks,
+    codex_session_parents: CodexSessionParents,
 ) {
     let mut buf = Vec::new();
     if stream.read_to_end(&mut buf).await.is_err() {
@@ -44,6 +46,18 @@ pub async fn handle_hook_connection(
     let session_id = data["session_id"].as_str().unwrap_or("unknown").to_string();
     info!(agent = %agent_name, event = %event, session_id = %session_id, "hook received");
     tracing::debug!(data = %data, "hook data");
+
+    maybe_watch_codex_parent(
+        &conn,
+        &ended,
+        &codex_session_parents,
+        &agent_name,
+        &session_id,
+        msg["parent_pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok()),
+    )
+    .await;
 
     match event.as_str() {
         "UpdateState" => {
@@ -104,12 +118,14 @@ pub async fn handle_hook_connection(
         }
 
         "SessionEnd" => {
-            ended
-                .lock()
-                .await
-                .insert(session_key(&agent_name, &session_id));
-            let path = session_path(&agent_name, &session_id);
-            let _ = conn.object_server().remove::<SessionObject, _>(&path).await;
+            remove_session(
+                &conn,
+                &ended,
+                &codex_session_parents,
+                &agent_name,
+                &session_id,
+            )
+            .await;
         }
 
         "TaskCompleted" => {
@@ -229,6 +245,82 @@ pub async fn handle_hook_connection(
             info!("Unknown hook event: {}", other);
         }
     }
+}
+
+async fn maybe_watch_codex_parent(
+    conn: &zbus::Connection,
+    ended: &EndedSessions,
+    codex_session_parents: &CodexSessionParents,
+    agent_name: &str,
+    session_id: &str,
+    parent_pid: Option<u32>,
+) {
+    if agent_name != "codex" || session_id == "unknown" {
+        return;
+    }
+
+    let Some(parent_pid) = parent_pid else {
+        return;
+    };
+
+    let key = session_key(agent_name, session_id);
+    let mut parents = codex_session_parents.lock().await;
+    if parents.get(&key) == Some(&parent_pid) {
+        return;
+    }
+    parents.insert(key.clone(), parent_pid);
+    drop(parents);
+
+    let conn = conn.clone();
+    let ended = ended.clone();
+    let codex_session_parents = codex_session_parents.clone();
+    let agent_name = agent_name.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(5)).await;
+            if process_exists(parent_pid) {
+                continue;
+            }
+
+            let still_current =
+                codex_session_parents.lock().await.get(&key).copied() == Some(parent_pid);
+            if still_current {
+                remove_session(
+                    &conn,
+                    &ended,
+                    &codex_session_parents,
+                    &agent_name,
+                    &session_id,
+                )
+                .await;
+                info!(
+                    session_id = %session_id,
+                    parent_pid,
+                    "removed codex session after parent process exited"
+                );
+            }
+            break;
+        }
+    });
+}
+
+async fn remove_session(
+    conn: &zbus::Connection,
+    ended: &EndedSessions,
+    codex_session_parents: &CodexSessionParents,
+    agent_name: &str,
+    session_id: &str,
+) {
+    let key = session_key(agent_name, session_id);
+    ended.lock().await.insert(key.clone());
+    codex_session_parents.lock().await.remove(&key);
+    let path = session_path(agent_name, session_id);
+    let _ = conn.object_server().remove::<SessionObject, _>(&path).await;
+}
+
+fn process_exists(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 fn build_permission_prompt(data: &serde_json::Value) -> String {

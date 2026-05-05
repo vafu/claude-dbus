@@ -13,6 +13,7 @@ mod types;
 
 pub type EndedSessions = Arc<Mutex<HashSet<String>>>;
 pub type ElicitationLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+pub type CodexSessionParents = Arc<Mutex<HashMap<String, u32>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ended: EndedSessions = Arc::new(Mutex::new(HashSet::new()));
     let elicitation_locks: ElicitationLocks = Arc::new(Mutex::new(HashMap::new()));
+    let codex_session_parents: CodexSessionParents = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         match listener.accept().await {
@@ -48,8 +50,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let conn = conn.clone();
                 let ended = Arc::clone(&ended);
                 let elicitation_locks = Arc::clone(&elicitation_locks);
+                let codex_session_parents = Arc::clone(&codex_session_parents);
                 tokio::spawn(async move {
-                    hooks::handle_hook_connection(stream, conn, ended, elicitation_locks).await;
+                    hooks::handle_hook_connection(
+                        stream,
+                        conn,
+                        ended,
+                        elicitation_locks,
+                        codex_session_parents,
+                    )
+                    .await;
                 });
             }
             Err(e) => info!("Socket accept error: {}", e),
