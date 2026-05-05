@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data: serde_json::Value =
         serde_json::from_str(stdin_data.trim()).unwrap_or(serde_json::Value::Null);
-    record_session_window_if_present(&agent, &event, &data);
+    record_session_links_if_present(&agent, &event, &data);
 
     let msg = serde_json::json!({
         "agent": agent,
@@ -59,76 +58,115 @@ fn parse_args() -> (String, String) {
     }
 }
 
-fn record_session_window_if_present(agent: &str, event: &str, data: &serde_json::Value) {
+fn record_session_links_if_present(agent: &str, event: &str, data: &serde_json::Value) {
     let session_id = data["session_id"].as_str().unwrap_or("");
-    let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
-    if session_id.is_empty() || window_id.is_empty() {
+    if session_id.is_empty() {
         return;
     }
 
-    record_session_window(agent, session_id, &window_id, event == "SessionEnd");
-}
-
-fn record_session_window(agent: &str, session_id: &str, window_id: &str, remove: bool) {
     let key = format!("{}/{}", safe_segment(agent), safe_segment(session_id));
-    update_mapping_file(&key, window_id, remove);
-    notify_ags(&key, window_id, remove);
-}
+    let remove = event == "SessionEnd";
 
-fn update_mapping_file(key: &str, window_id: &str, remove: bool) {
-    let path = mapping_path();
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(parent);
-
-    let mut mappings = read_mappings(&path);
-    match remove {
-        true => {
-            mappings.remove(key);
-        }
-        false => {
-            mappings.insert(key.to_string(), window_id.to_string());
-        }
+    let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
+    if !window_id.is_empty() {
+        update_locus_window_session_link(&key, &window_id, remove);
     }
 
-    let Ok(contents) = serde_json::to_string(&mappings) else {
-        return;
-    };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, contents).is_ok() {
-        let _ = std::fs::rename(tmp, &path);
-    }
+    update_locus_project_session_link(&key, data["cwd"].as_str(), remove);
 }
 
-fn read_mappings(path: &PathBuf) -> BTreeMap<String, String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
-}
-
-fn notify_ags(key: &str, window_id: &str, remove: bool) {
-    let mut command = vec!["request", "agent-session-window", "--session-id", key];
+fn update_locus_window_session_link(key: &str, window_id: &str, remove: bool) {
+    let source = format!("niri:window:{window_id}");
+    let target = format!("agent-session:{key}");
     if remove {
-        command.extend(["--remove", "true"]);
+        run_locusctl(["link", "remove", &source, "agent-session", &target]);
     } else {
-        command.extend(["--window-id", window_id]);
+        run_locusctl(["link", "add", &source, "agent-session", &target]);
     }
-    let _ = Command::new("ags")
-        .args(command)
+}
+
+fn update_locus_project_session_link(key: &str, cwd: Option<&str>, remove: bool) {
+    let target = format!("agent-session:{key}");
+    if remove {
+        remove_locus_project_session_links(&target);
+        return;
+    }
+
+    let Some(project_root) = cwd.and_then(project_root_for_cwd) else {
+        return;
+    };
+    let Some(source) = ensure_locus_project(&project_root) else {
+        return;
+    };
+
+    run_locusctl(["link", "add", &source, "agent-session", &target]);
+}
+
+fn remove_locus_project_session_links(target: &str) {
+    let Ok(output) = Command::new(locusctl_command())
+        .args(["link", "sources", target, "agent-session"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+
+    for source in String::from_utf8_lossy(&output.stdout).lines() {
+        if source.starts_with("project:") {
+            run_locusctl(["link", "remove", source, "agent-session", target]);
+        }
+    }
+}
+
+fn ensure_locus_project(path: &Path) -> Option<String> {
+    let output = Command::new(locusctl_command())
+        .args(["project", "ensure"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|subject| subject.trim().to_string())
+        .filter(|subject| !subject.is_empty())
+}
+
+fn project_root_for_cwd(cwd: &str) -> Option<PathBuf> {
+    let proj_dir = PathBuf::from(std::env::var_os("HOME")?).join("proj");
+    let cwd = PathBuf::from(cwd);
+    let relative = cwd.strip_prefix(&proj_dir).ok()?;
+    let Some(Component::Normal(project_name)) = relative.components().next() else {
+        return None;
+    };
+
+    Some(proj_dir.join(project_name))
+}
+
+fn run_locusctl<const N: usize>(args: [&str; N]) {
+    let _ = Command::new(locusctl_command())
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .status();
 }
 
-fn mapping_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("agent-dbus")
-        .join("session-windows.json")
+fn locusctl_command() -> PathBuf {
+    if let Some(path) = std::env::var_os("LOCUSCTL") {
+        return PathBuf::from(path);
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("locusctl")))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("locusctl"))
 }
 
 fn safe_segment(value: &str) -> String {
