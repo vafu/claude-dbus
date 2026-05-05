@@ -132,9 +132,7 @@ async fn update_locus_window_session_link(
     if remove {
         let _ = locus.remove_link(&source, "agent-session", &target).await;
     } else {
-        let _ = locus
-            .add_link(&source, "agent-session", &target, false)
-            .await;
+        let _ = locus.add_link(&source, "agent-session", &target).await;
     }
 }
 
