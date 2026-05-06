@@ -69,9 +69,6 @@ pub async fn handle_hook_connection(
                 info!(session_id = %session_id, "skipping UpdateState for ended session");
                 return;
             }
-            let ctx_pct = data["context_window"]["used_percentage"]
-                .as_f64()
-                .unwrap_or(0.0);
             let model = data["model"]["display_name"]
                 .as_str()
                 .or_else(|| data["model"].as_str())
@@ -80,7 +77,9 @@ pub async fn handle_hook_connection(
             let cwd = data["cwd"].as_str().unwrap_or("").to_string();
             let cost_usd = data["cost"]["total_cost_usd"].as_f64().unwrap_or(0.0);
             let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.context_pct = ctx_pct;
+                if let Some(ctx_pct) = context_pct(data) {
+                    d.context_pct = ctx_pct;
+                }
                 d.model_name = model;
                 d.cwd = cwd;
                 d.cost_usd = cost_usd;
@@ -500,16 +499,20 @@ fn apply_usage_limits(
     data: &serde_json::Value,
 ) {
     let fallback = if agent_name == "codex" {
-        codex_usage_limits(session_id)
+        codex_session_metrics(session_id)
     } else {
         None
     };
+
+    if let Some(pct) = context_pct(data).or_else(|| fallback.as_ref().and_then(|m| m.context_pct)) {
+        session.context_pct = pct;
+    }
 
     if let Some((pct, resets_at)) = usage_limit(data, "primary")
         .or_else(|| usage_limit(data, "five_hour"))
         .or_else(|| usage_limit(data, "fiveHour"))
         .or_else(|| usage_limit(data, "5h"))
-        .or(fallback.as_ref().and_then(|limits| limits.five_hour))
+        .or(fallback.as_ref().and_then(|metrics| metrics.five_hour))
     {
         session.five_hour_usage_pct = pct;
         session.five_hour_resets_at = resets_at;
@@ -519,11 +522,20 @@ fn apply_usage_limits(
         .or_else(|| usage_limit(data, "seven_day"))
         .or_else(|| usage_limit(data, "sevenDay"))
         .or_else(|| usage_limit(data, "7d"))
-        .or(fallback.as_ref().and_then(|limits| limits.seven_day))
+        .or(fallback.as_ref().and_then(|metrics| metrics.seven_day))
     {
         session.seven_day_usage_pct = pct;
         session.seven_day_resets_at = resets_at;
     }
+}
+
+fn context_pct(data: &serde_json::Value) -> Option<f64> {
+    data["context_window"]["used_percentage"]
+        .as_f64()
+        .or_else(|| data["context_window"]["used_percent"].as_f64())
+        .or_else(|| data["context"]["used_percentage"].as_f64())
+        .or_else(|| data["context"]["used_percent"].as_f64())
+        .or_else(|| data["context_pct"].as_f64())
 }
 
 fn usage_limit(data: &serde_json::Value, key: &str) -> Option<(f64, u64)> {
@@ -552,12 +564,13 @@ fn usage_limit(data: &serde_json::Value, key: &str) -> Option<(f64, u64)> {
 }
 
 #[derive(Clone, Copy)]
-struct UsageLimits {
+struct SessionMetrics {
+    context_pct: Option<f64>,
     five_hour: Option<(f64, u64)>,
     seven_day: Option<(f64, u64)>,
 }
 
-fn codex_usage_limits(session_id: &str) -> Option<UsageLimits> {
+fn codex_session_metrics(session_id: &str) -> Option<SessionMetrics> {
     let path = codex_session_file(session_id)?;
     let contents = std::fs::read_to_string(path).ok()?;
 
@@ -569,10 +582,25 @@ fn codex_usage_limits(session_id: &str) -> Option<UsageLimits> {
         }
 
         let data = serde_json::json!({ "rate_limits": payload["rate_limits"].clone() });
-        Some(UsageLimits {
+        Some(SessionMetrics {
+            context_pct: codex_context_pct(payload),
             five_hour: usage_limit(&data, "primary"),
             seven_day: usage_limit(&data, "secondary"),
         })
+    })
+}
+
+fn codex_context_pct(token_count_payload: &serde_json::Value) -> Option<f64> {
+    context_pct(token_count_payload).or_else(|| {
+        let window = token_count_payload["info"]["model_context_window"].as_f64()?;
+        if window <= 0.0 {
+            return None;
+        }
+
+        let used = token_count_payload["info"]["last_token_usage"]["total_tokens"]
+            .as_f64()
+            .or_else(|| token_count_payload["info"]["last_token_usage"]["input_tokens"].as_f64())?;
+        Some((used / window) * 100.0)
     })
 }
 
@@ -818,6 +846,42 @@ mod tests {
         assert_eq!(
             response["hookSpecificOutput"]["decision"]["updatedPermissions"][0],
             data["permission_suggestions"][1]
+        );
+    }
+
+    #[test]
+    fn codex_context_pct_uses_latest_token_count_window() {
+        let payload = json!({
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 100,
+                    "total_tokens": 250
+                },
+                "model_context_window": 1000
+            }
+        });
+
+        assert_eq!(codex_context_pct(&payload), Some(25.0));
+    }
+
+    #[test]
+    fn context_pct_accepts_direct_hook_shapes() {
+        assert_eq!(
+            context_pct(&json!({
+                "context_window": {
+                    "used_percentage": 12.5
+                }
+            })),
+            Some(12.5)
+        );
+        assert_eq!(
+            context_pct(&json!({
+                "context": {
+                    "used_percent": 40.0
+                }
+            })),
+            Some(40.0)
         );
     }
 }
