@@ -10,6 +10,7 @@ pub struct PendingRequest {
     pub id: String,
     pub prompt: String,
     pub options: Vec<String>,
+    pub option_descriptions: Vec<String>,
     pub tx: tokio::sync::oneshot::Sender<String>,
 }
 
@@ -49,6 +50,8 @@ struct SessionSnapshot {
     pending_request_ids: Vec<String>,
     pending_prompts: Vec<String>,
     pending_options_list: Vec<Vec<String>>,
+    pending_option_descriptions: Vec<String>,
+    pending_option_descriptions_list: Vec<Vec<String>>,
 }
 
 impl Default for SessionObject {
@@ -93,6 +96,19 @@ impl SessionObject {
             .unwrap_or_default()
     }
 
+    pub fn pending_option_descriptions_value(&self) -> Vec<&str> {
+        self.pending_requests
+            .front()
+            .map(|request| {
+                request
+                    .option_descriptions
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn pending_request_ids_value(&self) -> Vec<&str> {
         self.pending_requests
             .iter()
@@ -111,6 +127,19 @@ impl SessionObject {
         self.pending_requests
             .iter()
             .map(|request| request.options.iter().map(String::as_str).collect())
+            .collect()
+    }
+
+    pub fn pending_option_descriptions_list_value(&self) -> Vec<Vec<&str>> {
+        self.pending_requests
+            .iter()
+            .map(|request| {
+                request
+                    .option_descriptions
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
             .collect()
     }
 
@@ -149,6 +178,16 @@ impl SessionObject {
                 .pending_options_list_value()
                 .into_iter()
                 .map(|options| options.into_iter().map(str::to_string).collect())
+                .collect(),
+            pending_option_descriptions: self
+                .pending_option_descriptions_value()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            pending_option_descriptions_list: self
+                .pending_option_descriptions_list_value()
+                .into_iter()
+                .map(|descriptions| descriptions.into_iter().map(str::to_string).collect())
                 .collect(),
         }
     }
@@ -207,6 +246,9 @@ impl SessionObject {
         self.pending_request_ids_changed(emitter).await?;
         self.pending_prompts_changed(emitter).await?;
         self.pending_options_list_changed(emitter).await?;
+        self.pending_option_descriptions_changed(emitter).await?;
+        self.pending_option_descriptions_list_changed(emitter)
+            .await?;
         Ok(())
     }
 }
@@ -223,6 +265,10 @@ mod tests {
                 id: id.to_string(),
                 prompt: format!("prompt {id}"),
                 options: vec!["Allow".to_string(), "Deny".to_string()],
+                option_descriptions: vec![
+                    "Allow this request".to_string(),
+                    "Deny this request".to_string(),
+                ],
                 tx,
             },
             rx,
@@ -333,6 +379,14 @@ async fn emit_changed_properties(
     if before.pending_options_list != after.pending_options_list {
         iface.pending_options_list_changed(emitter).await?;
     }
+    if before.pending_option_descriptions != after.pending_option_descriptions {
+        iface.pending_option_descriptions_changed(emitter).await?;
+    }
+    if before.pending_option_descriptions_list != after.pending_option_descriptions_list {
+        iface
+            .pending_option_descriptions_list_changed(emitter)
+            .await?;
+    }
     Ok(())
 }
 
@@ -428,6 +482,16 @@ impl SessionObject {
         self.pending_options_list_value()
     }
 
+    #[zbus(property)]
+    fn pending_option_descriptions(&self) -> Vec<&str> {
+        self.pending_option_descriptions_value()
+    }
+
+    #[zbus(property)]
+    fn pending_option_descriptions_list(&self) -> Vec<Vec<&str>> {
+        self.pending_option_descriptions_list_value()
+    }
+
     async fn respond_to_elicitation(
         &mut self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -475,6 +539,23 @@ impl SessionObject {
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
+    async fn elicitation_requested_with_details(
+        emitter: &SignalEmitter<'_>,
+        prompt: &str,
+        options: &[&str],
+        option_descriptions: &[&str],
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn elicitation_requested_with_id_and_details(
+        emitter: &SignalEmitter<'_>,
+        request_id: &str,
+        prompt: &str,
+        options: &[&str],
+        option_descriptions: &[&str],
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
     async fn notification(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
 }
 
@@ -497,6 +578,33 @@ pub async fn emit_elicitation_with_id(
     options: &[&str],
 ) -> zbus::Result<()> {
     SessionObject::elicitation_requested_with_id(emitter, request_id, prompt, options).await
+}
+
+pub async fn emit_elicitation_with_details(
+    emitter: &SignalEmitter<'_>,
+    prompt: &str,
+    options: &[&str],
+    option_descriptions: &[&str],
+) -> zbus::Result<()> {
+    SessionObject::elicitation_requested_with_details(emitter, prompt, options, option_descriptions)
+        .await
+}
+
+pub async fn emit_elicitation_with_id_and_details(
+    emitter: &SignalEmitter<'_>,
+    request_id: &str,
+    prompt: &str,
+    options: &[&str],
+    option_descriptions: &[&str],
+) -> zbus::Result<()> {
+    SessionObject::elicitation_requested_with_id_and_details(
+        emitter,
+        request_id,
+        prompt,
+        options,
+        option_descriptions,
+    )
+    .await
 }
 
 pub async fn create_session(

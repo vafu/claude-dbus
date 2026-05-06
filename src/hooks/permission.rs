@@ -34,6 +34,16 @@ pub(super) fn build_permission_options(data: &serde_json::Value) -> Vec<String> 
     options
 }
 
+pub(super) fn build_permission_option_descriptions(
+    data: &serde_json::Value,
+    options: &[String],
+) -> Vec<String> {
+    options
+        .iter()
+        .map(|option| permission_option_description(data, option))
+        .collect()
+}
+
 fn is_codex_permission_request(data: &serde_json::Value) -> bool {
     data["hook_event_name"].as_str() == Some("PermissionRequest")
         && data["transcript_path"].as_str().is_some()
@@ -47,6 +57,85 @@ fn permission_suggestion_label(suggestion: &serde_json::Value) -> String {
     } else {
         format!("Always allow ({dest})")
     }
+}
+
+fn permission_option_description(data: &serde_json::Value, option: &str) -> String {
+    let normalized = option.trim().to_ascii_lowercase();
+    if normalized == "allow" || normalized.starts_with("allow ") {
+        return "Allow only this request.".to_string();
+    }
+    if normalized == "deny" || normalized.starts_with("deny ") {
+        return "Deny this request.".to_string();
+    }
+    if !is_always_allow_answer(option) {
+        return String::new();
+    }
+
+    if let Some(prefix_rule) = codex_prefix_rule(data) {
+        return format!(
+            "Persistently allow commands starting with: {}",
+            format_rule_values(prefix_rule)
+        );
+    }
+
+    permission_suggestion_for_answer(data, option)
+        .as_ref()
+        .map(permission_suggestion_description)
+        .unwrap_or_else(|| "Persistently allow matching future requests.".to_string())
+}
+
+fn permission_suggestion_description(suggestion: &serde_json::Value) -> String {
+    let rules = suggestion["rules"]
+        .as_array()
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(permission_rule_description)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let destination = suggestion["destination"].as_str().unwrap_or("");
+    let mut description = if rules.is_empty() {
+        "Persistently allow matching future requests.".to_string()
+    } else {
+        format!("Persistently allow: {}", rules.join("; "))
+    };
+    if !destination.is_empty() {
+        description.push_str(&format!(" Destination: {destination}."));
+    }
+    description
+}
+
+fn permission_rule_description(rule: &serde_json::Value) -> Option<String> {
+    let tool_name = rule["toolName"]
+        .as_str()
+        .or_else(|| rule["tool_name"].as_str());
+    let rule_content = rule["ruleContent"]
+        .as_str()
+        .or_else(|| rule["rule_content"].as_str());
+
+    match (tool_name, rule_content) {
+        (Some(tool_name), Some(rule_content)) => Some(format!("{tool_name} {rule_content}")),
+        (Some(tool_name), None) => Some(tool_name.to_string()),
+        (None, Some(rule_content)) => Some(rule_content.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn format_rule_values(values: &[serde_json::Value]) -> String {
+    values
+        .iter()
+        .map(format_rule_value)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_rule_value(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 pub(super) fn build_elicitation_options(data: &serde_json::Value) -> Vec<String> {

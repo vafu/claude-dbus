@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
 use agent_dbus::constants::socket_path;
-use agent_dbus::path::agent_session_node_key;
+use agent_dbus::path::{agent_session_node_key, safe_path_segment};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -116,24 +116,49 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
     let key = agent_session_node_key(agent, session_id);
     let remove = event == "SessionEnd";
 
+    let app_instance = std::env::var("LOCUS_APP_INSTANCE").unwrap_or_default();
+    if !app_instance.is_empty() {
+        update_locus_agent_session_link(&locus, &key, &app_instance, None, remove).await;
+        return;
+    }
+
     let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
     if !window_id.is_empty() {
-        update_locus_window_session_link(&locus, &key, &window_id, remove).await;
+        let app_instance = format!("app-instance:{key}");
+        update_locus_agent_session_link(&locus, &key, &app_instance, Some((agent, &window_id)), remove)
+            .await;
     }
 }
 
-async fn update_locus_window_session_link(
+async fn update_locus_agent_session_link(
     locus: &locus::Client<'_>,
     key: &str,
-    window_id: &str,
+    app_instance: &str,
+    fallback_window: Option<(&str, &str)>,
     remove: bool,
 ) {
-    let source = format!("window:{window_id}");
     let target = format!("agent-session:{key}");
     if remove {
-        let _ = locus.remove_link(&source, "agent-session", &target).await;
+        let _ = locus
+            .remove_link(app_instance, "agent-session", &target)
+            .await;
+        if let Some((_, window_id)) = fallback_window {
+            let window = format!("window:{window_id}");
+            let _ = locus
+                .remove_link(&window, "app-instance", app_instance)
+                .await;
+        }
     } else {
+        if let Some((agent, window_id)) = fallback_window {
+            let window = format!("window:{window_id}");
+            let _ = locus.set_property(app_instance, "kind", "app-instance").await;
+            let _ = locus.set_property(app_instance, "name", agent).await;
+            let _ = locus
+                .set_property(app_instance, "icon", &safe_path_segment(agent))
+                .await;
+            let _ = locus.set_link(&window, "app-instance", app_instance).await;
+        }
         let _ = locus.set_property(&target, "kind", "agent-session").await;
-        let _ = locus.set_link(&source, "agent-session", &target).await;
+        let _ = locus.set_link(app_instance, "agent-session", &target).await;
     }
 }

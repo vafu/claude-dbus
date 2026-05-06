@@ -7,8 +7,9 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{info, warn};
 
 use crate::dbus::{
-    PendingRequest, SessionObject, create_session, emit_elicitation, emit_elicitation_with_id,
-    emit_notification, update_session,
+    PendingRequest, SessionObject, create_session, emit_elicitation, emit_elicitation_with_details,
+    emit_elicitation_with_id, emit_elicitation_with_id_and_details, emit_notification,
+    update_session,
 };
 use crate::types::SessionState;
 use crate::{CodexSessionParents, EndedSessions};
@@ -21,8 +22,8 @@ mod permission;
 use metrics::codex_context_pct;
 use metrics::{apply_usage_limits, context_pct};
 use permission::{
-    build_elicitation_options, build_permission_options, build_permission_prompt,
-    permission_response,
+    build_elicitation_options, build_permission_option_descriptions, build_permission_options,
+    build_permission_prompt, permission_response,
 };
 
 static NEXT_PENDING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -423,12 +424,15 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
+            let options = build_permission_options(data);
+            let option_descriptions = build_permission_option_descriptions(data, &options);
             let response = handle_elicitation_event(
                 &conn,
                 &agent_name,
                 &session_id,
                 build_permission_prompt(data),
-                build_permission_options(data),
+                options,
+                option_descriptions,
             )
             .await;
             if let Some(decision) = permission_response(data, &response) {
@@ -447,8 +451,16 @@ pub async fn handle_hook_connection(
                 .unwrap_or("Agent needs input")
                 .to_string();
             let options = build_elicitation_options(data);
-            let response =
-                handle_elicitation_event(&conn, &agent_name, &session_id, prompt, options).await;
+            let option_descriptions = vec![String::new(); options.len()];
+            let response = handle_elicitation_event(
+                &conn,
+                &agent_name,
+                &session_id,
+                prompt,
+                options,
+                option_descriptions,
+            )
+            .await;
             if let Err(err) = stream.write_all(response.as_bytes()).await {
                 warn!(%err, "failed to write elicitation response");
             }
@@ -555,6 +567,7 @@ async fn handle_elicitation_event(
     session_id: &str,
     prompt: String,
     options: Vec<String>,
+    option_descriptions: Vec<String>,
 ) -> String {
     use tokio::sync::oneshot;
     info!(agent = %agent_name, session_id = %session_id, prompt = %prompt, ?options, "elicitation");
@@ -584,6 +597,7 @@ async fn handle_elicitation_event(
             id: request_id.clone(),
             prompt: prompt.clone(),
             options: options.clone(),
+            option_descriptions: option_descriptions.clone(),
             tx,
         });
     }
@@ -597,6 +611,8 @@ async fn handle_elicitation_event(
     }
 
     let option_refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+    let option_description_refs: Vec<&str> =
+        option_descriptions.iter().map(|s| s.as_str()).collect();
     log_zbus_result(
         emit_elicitation(emitter, &prompt, &option_refs).await,
         "emit_elicitation",
@@ -605,6 +621,24 @@ async fn handle_elicitation_event(
     log_zbus_result(
         emit_elicitation_with_id(emitter, &request_id, &prompt, &option_refs).await,
         "emit_elicitation_with_id",
+        session_id,
+    );
+    log_zbus_result(
+        emit_elicitation_with_details(emitter, &prompt, &option_refs, &option_description_refs)
+            .await,
+        "emit_elicitation_with_details",
+        session_id,
+    );
+    log_zbus_result(
+        emit_elicitation_with_id_and_details(
+            emitter,
+            &request_id,
+            &prompt,
+            &option_refs,
+            &option_description_refs,
+        )
+        .await,
+        "emit_elicitation_with_id_and_details",
         session_id,
     );
 
@@ -758,6 +792,30 @@ mod tests {
     }
 
     #[test]
+    fn permission_option_descriptions_explain_always_allow_suggestion() {
+        let data = json!({
+            "permission_suggestions": [
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "npm test" }],
+                    "behavior": "allow",
+                    "destination": "localSettings"
+                }
+            ]
+        });
+        let options = build_permission_options(&data);
+
+        assert_eq!(
+            build_permission_option_descriptions(&data, &options),
+            vec![
+                "Allow only this request.",
+                "Persistently allow: Bash npm test Destination: localSettings.",
+                "Deny this request."
+            ]
+        );
+    }
+
+    #[test]
     fn codex_permission_options_do_not_offer_always_allow_without_prefix_rule() {
         let data = json!({
             "hook_event_name": "PermissionRequest",
@@ -800,6 +858,26 @@ mod tests {
             response["hookSpecificOutput"]["decision"]
                 .get("updatedPermissions")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn codex_permission_option_descriptions_explain_prefix_rule() {
+        let data = json!({
+            "hook_event_name": "PermissionRequest",
+            "permission_mode": "default",
+            "transcript_path": "/tmp/codex-session.jsonl",
+            "prefix_rule": ["rm", "-rf", "/tmp/example"]
+        });
+        let options = build_permission_options(&data);
+
+        assert_eq!(
+            build_permission_option_descriptions(&data, &options),
+            vec![
+                "Allow only this request.",
+                "Persistently allow commands starting with: rm -rf /tmp/example",
+                "Deny this request."
+            ]
         );
     }
 

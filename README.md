@@ -191,10 +191,12 @@ Use `GetManagedObjects` to list all active sessions.
 | `SevenDayResetsAt` | `t` | Unix timestamp for the 7-day usage reset |
 | `PendingPrompt` | `s` | Prompt for the oldest pending request, for compatibility |
 | `PendingOptions` | `as` | Options for the oldest pending request, for compatibility |
+| `PendingOptionDescriptions` | `as` | Details for each option on the oldest pending request |
 | `PendingCount` | `u` | Number of pending approval/input requests |
 | `PendingRequestIds` | `as` | Request ids for all pending approval/input requests |
 | `PendingPrompts` | `as` | Prompts for all pending approval/input requests |
 | `PendingOptionsList` | `aas` | Options for all pending approval/input requests |
+| `PendingOptionDescriptionsList` | `aas` | Details for each option on all pending approval/input requests |
 
 #### Methods
 
@@ -209,6 +211,8 @@ Use `GetManagedObjects` to list all active sessions.
 |--------|-----------|-------------|
 | `ElicitationRequested` | `sas` | `prompt`, `options` - agent needs user input |
 | `ElicitationRequestedWithId` | `ssas` | `request_id`, `prompt`, `options` - id-aware request signal |
+| `ElicitationRequestedWithDetails` | `sasas` | `prompt`, `options`, `option_descriptions` - includes detail text for each option |
+| `ElicitationRequestedWithIdAndDetails` | `ssasas` | `request_id`, `prompt`, `options`, `option_descriptions` - id-aware detail signal |
 | `Notification` | `s` | `message` - notification from a compatible hook |
 
 ### Introspect
