@@ -127,12 +127,13 @@ async fn update_locus_window_session_link(
     window_id: &str,
     remove: bool,
 ) {
-    let source = format!("niri:window:{window_id}");
+    let source = format!("window:{window_id}");
     let target = format!("agent-session:{key}");
     if remove {
         let _ = locus.remove_link(&source, "agent-session", &target).await;
     } else {
-        let _ = locus.add_link(&source, "agent-session", &target).await;
+        let _ = locus.set_property(&target, "kind", "agent-session").await;
+        let _ = locus.set_link(&source, "agent-session", &target).await;
     }
 }
 

@@ -517,8 +517,14 @@ fn is_decline_option(option: &str) -> bool {
 fn permission_response(data: &serde_json::Value, answer: &str) -> Option<String> {
     let answer = answer.trim();
     if is_always_allow_answer(answer) {
-        permission_suggestion_for_answer(data, answer)
-            .map(|suggestion| permission_allow_response(vec![suggestion]))
+        if let Some(prefix_rule) = codex_prefix_rule(data) {
+            Some(permission_allow_response_with_exec_policy_amendment(
+                prefix_rule.clone(),
+            ))
+        } else {
+            permission_suggestion_for_answer(data, answer)
+                .map(|suggestion| permission_allow_response(vec![suggestion]))
+        }
     } else if is_allow_answer(answer) {
         Some(permission_allow_response(Vec::new()))
     } else if answer.eq_ignore_ascii_case("deny") || answer.starts_with("Deny") {
@@ -529,6 +535,13 @@ fn permission_response(data: &serde_json::Value, answer: &str) -> Option<String>
     } else {
         None
     }
+}
+
+fn codex_prefix_rule(data: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if !is_codex_permission_request(data) {
+        return None;
+    }
+    data["prefix_rule"].as_array()
 }
 
 fn is_allow_answer(answer: &str) -> bool {
@@ -570,6 +583,21 @@ fn permission_allow_response(updated_permissions: Vec<serde_json::Value>) -> Str
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",
             "decision": decision
+        }
+    })
+    .to_string()
+}
+
+fn permission_allow_response_with_exec_policy_amendment(
+    exec_policy_amendment: Vec<serde_json::Value>,
+) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "allow",
+                "execPolicyAmendment": exec_policy_amendment
+            }
         }
     })
     .to_string()
@@ -935,6 +963,29 @@ mod tests {
             vec!["Allow", "Always allow", "Deny"]
         );
         assert_eq!(permission_response(&data, "Always allow"), None);
+    }
+
+    #[test]
+    fn codex_permission_response_uses_exec_policy_amendment() {
+        let data = json!({
+            "hook_event_name": "PermissionRequest",
+            "permission_mode": "default",
+            "transcript_path": "/tmp/codex-session.jsonl",
+            "prefix_rule": ["cargo", "build"]
+        });
+
+        let response: serde_json::Value =
+            serde_json::from_str(&permission_response(&data, "Always allow").unwrap()).unwrap();
+
+        assert_eq!(
+            response["hookSpecificOutput"]["decision"]["execPolicyAmendment"],
+            json!(["cargo", "build"])
+        );
+        assert!(
+            response["hookSpecificOutput"]["decision"]
+                .get("updatedPermissions")
+                .is_none()
+        );
     }
 
     #[test]

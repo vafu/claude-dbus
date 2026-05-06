@@ -6,7 +6,7 @@ version = 4
 name = "agent-dbus"
 version = "0.1.0"
 dependencies = [
- "locus-api",
+ "locus-dbus",
  "serde_json",
  "tokio",
  "tracing",
@@ -432,7 +432,12 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "locus-api"
 version = "0.1.0"
+
+[[package]]
+name = "locus-dbus"
+version = "0.1.0"
 dependencies = [
+ "locus-api",
  "zbus",
 ]
 
