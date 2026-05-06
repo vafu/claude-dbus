@@ -43,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ended: EndedSessions = Arc::new(Mutex::new(HashSet::new()));
     let elicitation_locks: ElicitationLocks = Arc::new(Mutex::new(HashMap::new()));
     let codex_session_parents: CodexSessionParents = Arc::new(Mutex::new(HashMap::new()));
+    hooks::start_codex_compact_watcher(conn.clone());
 
     loop {
         match listener.accept().await {

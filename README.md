@@ -18,11 +18,14 @@ agent-dbus                       (long-running service)
       +-- per-session D-Bus objects with properties
       +-- ObjectManager signals for session lifecycle
       +-- blocking approval/input requests -> waits for RespondToElicitation
+      +-- Codex compact state watcher -> tails ~/.codex/log/codex-tui.log
 ```
 
 The service stores sessions under both agent name and session id, so `claude` and `codex` sessions can run at the same time without object-path collisions.
 
 Codex does not currently expose a `SessionEnd` command hook. For Codex hook messages, `agent-hook` includes the parent Codex process id and `agent-dbus` removes the session object after that process exits. `Stop` still means turn completion.
+
+Codex also does not expose a compact lifecycle hook. To surface `compacting` state for Codex sessions, `agent-dbus` watches the local Codex TUI log for `op.dispatch.compact` start/close lines and maps those `thread_id` values back to Codex session objects. All regular lifecycle events, approval/input requests, and session metrics still flow through the Unix socket hook path.
 
 ## Requirements
 

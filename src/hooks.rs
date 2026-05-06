@@ -1,3 +1,4 @@
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,6 +11,98 @@ use crate::dbus::{
 };
 use crate::types::SessionState;
 use crate::{CodexSessionParents, ElicitationLocks, EndedSessions};
+
+pub fn start_codex_compact_watcher(conn: zbus::Connection) {
+    let Some(path) = codex_log_file() else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        loop {
+            sleep(Duration::from_millis(500)).await;
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.len() < offset {
+                offset = 0;
+            }
+            if metadata.len() == offset {
+                continue;
+            }
+
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            let mut chunk = String::new();
+            if file.read_to_string(&mut chunk).is_err() {
+                continue;
+            }
+            offset = metadata.len();
+
+            for line in chunk.lines() {
+                if let Some(event) = parse_codex_compact_log_line(line) {
+                    apply_codex_compact_log_event(&conn, event).await;
+                }
+            }
+        }
+    });
+}
+
+fn codex_log_file() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".codex/log/codex-tui.log"))
+}
+
+#[derive(Debug, PartialEq)]
+struct CodexCompactLogEvent {
+    session_id: String,
+    active: bool,
+}
+
+fn parse_codex_compact_log_line(line: &str) -> Option<CodexCompactLogEvent> {
+    if !line.contains("codex.op=\"compact\"") {
+        return None;
+    }
+
+    let active = if line.contains("codex_core::session::handlers: new") {
+        true
+    } else if line.contains("codex_core::session::handlers: close") {
+        false
+    } else {
+        return None;
+    };
+
+    Some(CodexCompactLogEvent {
+        session_id: parse_thread_id(line)?.to_string(),
+        active,
+    })
+}
+
+fn parse_thread_id(line: &str) -> Option<&str> {
+    let start = line.find("thread_id=")? + "thread_id=".len();
+    let rest = &line[start..];
+    let end = rest.find('}')?;
+    Some(&rest[..end])
+}
+
+async fn apply_codex_compact_log_event(conn: &zbus::Connection, event: CodexCompactLogEvent) {
+    let _ = update_session(conn, "codex", &event.session_id, |d| {
+        if event.active {
+            d.state = SessionState::Compacting;
+            d.task_complete = false;
+            clear_pending_if_not_waiting(d);
+        } else if d.state == SessionState::Compacting {
+            d.state = SessionState::Idle;
+            d.task_complete = true;
+            clear_pending_if_not_waiting(d);
+        }
+    })
+    .await;
+}
 
 pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
@@ -882,6 +975,27 @@ mod tests {
                 }
             })),
             Some(40.0)
+        );
+    }
+
+    #[test]
+    fn parses_codex_compact_log_start_and_close() {
+        let start = r#"2026-05-06T02:50:09.656315Z  INFO session_loop{thread_id=019df591-2434-7e53-bbec-94ae22260f7b}:submission_dispatch{otel.name="op.dispatch.compact" submission.id="019dfb31-5d78-7ba3-87f3-569187bb5f1f" codex.op="compact"}: codex_core::session::handlers: new"#;
+        let close = r#"2026-05-06T02:50:38.077064Z  INFO session_loop{thread_id=019df591-2434-7e53-bbec-94ae22260f7b}:submission_dispatch{otel.name="op.dispatch.compact" submission.id="019dfb31-5d78-7ba3-87f3-569187bb5f1f" codex.op="compact"}: codex_core::session::handlers: close time.busy=766µs time.idle=28.4s"#;
+
+        assert_eq!(
+            parse_codex_compact_log_line(start),
+            Some(CodexCompactLogEvent {
+                session_id: "019df591-2434-7e53-bbec-94ae22260f7b".to_string(),
+                active: true
+            })
+        );
+        assert_eq!(
+            parse_codex_compact_log_line(close),
+            Some(CodexCompactLogEvent {
+                session_id: "019df591-2434-7e53-bbec-94ae22260f7b".to_string(),
+                active: false
+            })
         );
     }
 }

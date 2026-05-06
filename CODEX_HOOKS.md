@@ -113,6 +113,7 @@ Create `~/.codex/hooks.json` with:
 
 These hooks cover session creation, prompt submission, tool activity, approval prompts, and turn completion.
 Codex does not currently expose a separate session-end hook; `agent-dbus` removes the session object when the originating Codex process exits.
+Codex also does not currently expose a compact lifecycle hook. `agent-dbus` detects Codex compaction by watching `~/.codex/log/codex-tui.log` for `op.dispatch.compact` start/close lines and updates the matching session state to `compacting` while that task is active.
 
 ## Verify
 
