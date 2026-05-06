@@ -427,9 +427,18 @@ fn build_permission_options(data: &serde_json::Value) -> Vec<String> {
             }
         })
         .collect();
+    if always_allow_options.is_empty() && is_codex_permission_request(data) {
+        always_allow_options.push("Always allow".to_string());
+    }
     options.append(&mut always_allow_options);
     options.push("Deny".to_string());
     options
+}
+
+fn is_codex_permission_request(data: &serde_json::Value) -> bool {
+    data["hook_event_name"].as_str() == Some("PermissionRequest")
+        && data["transcript_path"].as_str().is_some()
+        && data["permission_mode"].as_str().is_some()
 }
 
 fn permission_suggestion_label(suggestion: &serde_json::Value) -> String {
@@ -508,10 +517,8 @@ fn is_decline_option(option: &str) -> bool {
 fn permission_response(data: &serde_json::Value, answer: &str) -> Option<String> {
     let answer = answer.trim();
     if is_always_allow_answer(answer) {
-        let updated_permissions = permission_suggestion_for_answer(data, answer)
-            .map(|suggestion| vec![suggestion.clone()])
-            .unwrap_or_default();
-        Some(permission_allow_response(updated_permissions))
+        permission_suggestion_for_answer(data, answer)
+            .map(|suggestion| permission_allow_response(vec![suggestion]))
     } else if is_allow_answer(answer) {
         Some(permission_allow_response(Vec::new()))
     } else if answer.eq_ignore_ascii_case("deny") || answer.starts_with("Deny") {
@@ -536,7 +543,7 @@ fn is_always_allow_answer(answer: &str) -> bool {
 fn permission_suggestion_for_answer<'a>(
     data: &'a serde_json::Value,
     answer: &str,
-) -> Option<&'a serde_json::Value> {
+) -> Option<serde_json::Value> {
     let suggestions = data["permission_suggestions"].as_array()?;
     let answer = answer.trim();
     suggestions
@@ -550,6 +557,7 @@ fn permission_suggestion_for_answer<'a>(
                 .iter()
                 .find(|suggestion| suggestion["behavior"].as_str() == Some("allow"))
         })
+        .cloned()
 }
 
 fn permission_allow_response(updated_permissions: Vec<serde_json::Value>) -> String {
@@ -912,6 +920,21 @@ mod tests {
             build_permission_options(&data),
             vec!["Allow", "Always allow (localSettings)", "Deny"]
         );
+    }
+
+    #[test]
+    fn codex_permission_options_offer_native_always_allow_fallback() {
+        let data = json!({
+            "hook_event_name": "PermissionRequest",
+            "permission_mode": "default",
+            "transcript_path": "/tmp/codex-session.jsonl"
+        });
+
+        assert_eq!(
+            build_permission_options(&data),
+            vec!["Allow", "Always allow", "Deny"]
+        );
+        assert_eq!(permission_response(&data, "Always allow"), None);
     }
 
     #[test]
