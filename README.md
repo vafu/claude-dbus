@@ -234,4 +234,4 @@ busctl --user call io.github.AgentDBus /io/github/AgentDBus org.freedesktop.DBus
 | Flag | Set by | Cleared by |
 |------|--------|------------|
 | `TaskComplete` | `Stop`, `TaskCompleted` | `SessionStart`, `UserPromptSubmit` |
-| `RequiresAttention` | `PermissionRequest`, `Elicitation` | `PostToolUse`, user response, `UserPromptSubmit` |
+| `RequiresAttention` | `PermissionRequest`, `Elicitation`, `RequestUserInput` | `PostToolUse`, user response, `RequestUserInputResolved`, `UserPromptSubmit` |

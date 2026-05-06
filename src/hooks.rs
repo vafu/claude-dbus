@@ -454,6 +454,28 @@ pub async fn handle_hook_connection(
             }
         }
 
+        "RequestUserInput" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_request_user_input_attention(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "RequestUserInputResolved" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    clear_request_user_input_attention(d);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
         other => {
             info!("Unknown hook event: {}", other);
         }
@@ -624,6 +646,24 @@ fn clear_pending_if_not_waiting(session: &mut SessionObject) {
     if session.pending_requests.is_empty() {
         session.requires_attention = false;
     }
+}
+
+fn apply_request_user_input_attention(
+    session: &mut SessionObject,
+    agent_name: &str,
+    session_id: &str,
+    data: &serde_json::Value,
+) {
+    session.state = SessionState::Thinking;
+    session.task_complete = false;
+    session.requires_attention = true;
+    session.model_name = model_name(data);
+    session.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+    apply_usage_limits(session, agent_name, session_id, data);
+}
+
+fn clear_request_user_input_attention(session: &mut SessionObject) {
+    clear_pending_if_not_waiting(session);
 }
 
 fn next_pending_request_id() -> String {
@@ -847,5 +887,28 @@ mod tests {
                 active: false
             })
         );
+    }
+
+    #[test]
+    fn request_user_input_attention_sets_and_clears_without_pending_requests() {
+        let mut session = SessionObject::new("codex");
+        let data = json!({
+            "session_id": "session-1",
+            "cwd": "/tmp/project",
+            "model": "gpt-test"
+        });
+
+        apply_request_user_input_attention(&mut session, "codex", "session-1", &data);
+
+        assert!(matches!(session.state, SessionState::Thinking));
+        assert!(!session.task_complete);
+        assert!(session.requires_attention);
+        assert_eq!(session.model_name, "gpt-test");
+        assert_eq!(session.cwd, "/tmp/project");
+        assert_eq!(session.pending_requests.len(), 0);
+
+        clear_request_user_input_attention(&mut session);
+
+        assert!(!session.requires_attention);
     }
 }
