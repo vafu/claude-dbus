@@ -1,16 +1,19 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, sleep};
 use tracing::info;
 
 use crate::dbus::{
-    SessionObject, create_session, emit_elicitation, emit_notification, session_path,
-    update_session,
+    PendingRequest, SessionObject, create_session, emit_elicitation, emit_elicitation_with_id,
+    emit_notification, session_path, update_session,
 };
 use crate::types::SessionState;
-use crate::{CodexSessionParents, ElicitationLocks, EndedSessions};
+use crate::{CodexSessionParents, EndedSessions};
+
+static NEXT_PENDING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn start_codex_compact_watcher(conn: zbus::Connection) {
     let Some(path) = codex_log_file() else {
@@ -108,7 +111,6 @@ pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
     conn: zbus::Connection,
     ended: EndedSessions,
-    elicitation_locks: ElicitationLocks,
     codex_session_parents: CodexSessionParents,
 ) {
     let mut buf = Vec::new();
@@ -290,7 +292,6 @@ pub async fn handle_hook_connection(
             .await;
             let response = handle_elicitation_event(
                 &conn,
-                &elicitation_locks,
                 &agent_name,
                 &session_id,
                 build_permission_prompt(data),
@@ -311,15 +312,8 @@ pub async fn handle_hook_connection(
                 .unwrap_or("Agent needs input")
                 .to_string();
             let options = build_elicitation_options(data);
-            let response = handle_elicitation_event(
-                &conn,
-                &elicitation_locks,
-                &agent_name,
-                &session_id,
-                prompt,
-                options,
-            )
-            .await;
+            let response =
+                handle_elicitation_event(&conn, &agent_name, &session_id, prompt, options).await;
             let _ = stream.write_all(response.as_bytes()).await;
         }
 
@@ -740,7 +734,6 @@ fn collect_matching_codex_sessions(dir: &Path, session_id: &str, matches: &mut V
 
 async fn handle_elicitation_event(
     conn: &zbus::Connection,
-    elicitation_locks: &ElicitationLocks,
     agent_name: &str,
     session_id: &str,
     prompt: String,
@@ -748,15 +741,6 @@ async fn handle_elicitation_event(
 ) -> String {
     use tokio::sync::oneshot;
     info!(agent = %agent_name, session_id = %session_id, prompt = %prompt, ?options, "elicitation");
-
-    let session_lock = {
-        let mut locks = elicitation_locks.lock().await;
-        locks
-            .entry(session_key(agent_name, session_id))
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
-    let _session_guard = session_lock.lock().await;
 
     let path = session_path(agent_name, session_id);
     let _ = conn
@@ -773,12 +757,16 @@ async fn handle_elicitation_event(
     };
 
     let (tx, rx) = oneshot::channel();
+    let request_id = next_pending_request_id();
     {
         let mut iface = iface_ref.get_mut().await;
-        iface.pending_prompt = prompt.clone();
-        iface.pending_options = options.clone();
+        iface.pending_requests.push(PendingRequest {
+            id: request_id.clone(),
+            prompt: prompt.clone(),
+            options: options.clone(),
+            tx,
+        });
         iface.requires_attention = true;
-        iface.elicitation_tx = Some(tx);
     }
 
     let emitter = iface_ref.signal_emitter();
@@ -786,11 +774,16 @@ async fn handle_elicitation_event(
         let iface = iface_ref.get().await;
         let _ = iface.pending_prompt_changed(emitter).await;
         let _ = iface.pending_options_changed(emitter).await;
+        let _ = iface.pending_count_changed(emitter).await;
+        let _ = iface.pending_request_ids_changed(emitter).await;
+        let _ = iface.pending_prompts_changed(emitter).await;
+        let _ = iface.pending_options_list_changed(emitter).await;
         let _ = iface.requires_attention_changed(emitter).await;
     }
 
     let option_refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
     let _ = emit_elicitation(emitter, &prompt, &option_refs).await;
+    let _ = emit_elicitation_with_id(emitter, &request_id, &prompt, &option_refs).await;
 
     let answer = match rx.await {
         Ok(answer) => answer,
@@ -801,32 +794,40 @@ async fn handle_elicitation_event(
     };
     info!(agent = %agent_name, session_id = %session_id, answer = %answer, "elicitation answered");
 
-    let mut should_clear = false;
     {
         let mut iface = iface_ref.get_mut().await;
-        if iface.pending_prompt == prompt && iface.elicitation_tx.is_none() {
-            iface.requires_attention = false;
-            iface.pending_prompt.clear();
-            iface.pending_options.clear();
-            should_clear = true;
+        if let Some(index) = iface
+            .pending_requests
+            .iter()
+            .position(|request| request.id == request_id)
+        {
+            iface.pending_requests.remove(index);
+            iface.requires_attention = !iface.pending_requests.is_empty();
         }
     }
-    if should_clear {
-        let iface = iface_ref.get().await;
-        let _ = iface.requires_attention_changed(emitter).await;
-        let _ = iface.pending_prompt_changed(emitter).await;
-        let _ = iface.pending_options_changed(emitter).await;
-    }
+    let iface = iface_ref.get().await;
+    let _ = iface.requires_attention_changed(emitter).await;
+    let _ = iface.pending_prompt_changed(emitter).await;
+    let _ = iface.pending_options_changed(emitter).await;
+    let _ = iface.pending_count_changed(emitter).await;
+    let _ = iface.pending_request_ids_changed(emitter).await;
+    let _ = iface.pending_prompts_changed(emitter).await;
+    let _ = iface.pending_options_list_changed(emitter).await;
 
     answer
 }
 
 fn clear_pending_if_not_waiting(session: &mut SessionObject) {
-    if session.elicitation_tx.is_none() {
+    if session.pending_requests.is_empty() {
         session.requires_attention = false;
-        session.pending_prompt.clear();
-        session.pending_options.clear();
     }
+}
+
+fn next_pending_request_id() -> String {
+    format!(
+        "req-{}",
+        NEXT_PENDING_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]

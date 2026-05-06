@@ -17,7 +17,7 @@ agent-dbus                       (long-running service)
       |
       +-- per-session D-Bus objects with properties
       +-- ObjectManager signals for session lifecycle
-      +-- blocking approval/input requests -> waits for RespondToElicitation
+      +-- blocking approval/input requests -> waits for RespondToElicitation or RespondToElicitationById
       +-- Codex compact state watcher -> tails ~/.codex/log/codex-tui.log
 ```
 
@@ -104,9 +104,10 @@ If the UI is unavailable, answer a pending request directly:
 ```bash
 agent-respond <agent-name> <session-id> "Allow"
 agent-respond codex 019dea3f-6d06-79b3-96c5-35f0e602c169 "Deny"
+agent-respond codex 019dea3f-6d06-79b3-96c5-35f0e602c169 --request-id req-2 "Allow"
 ```
 
-The session id is the original hook `session_id`; `agent-respond` applies the same D-Bus path escaping as the service.
+Without `--request-id`, `agent-respond` answers the oldest pending request for the session. The session id is the original hook `session_id`; `agent-respond` applies the same D-Bus path escaping as the service.
 
 ## Configure Codex Hooks
 
@@ -188,20 +189,26 @@ Use `GetManagedObjects` to list all active sessions.
 | `FiveHourResetsAt` | `t` | Unix timestamp for the 5-hour usage reset |
 | `SevenDayUsagePct` | `d` | Current 7-day usage percentage, when available |
 | `SevenDayResetsAt` | `t` | Unix timestamp for the 7-day usage reset |
-| `PendingPrompt` | `s` | Prompt for the current pending request |
-| `PendingOptions` | `as` | Options for the current pending request |
+| `PendingPrompt` | `s` | Prompt for the oldest pending request, for compatibility |
+| `PendingOptions` | `as` | Options for the oldest pending request, for compatibility |
+| `PendingCount` | `u` | Number of pending approval/input requests |
+| `PendingRequestIds` | `as` | Request ids for all pending approval/input requests |
+| `PendingPrompts` | `as` | Prompts for all pending approval/input requests |
+| `PendingOptionsList` | `aas` | Options for all pending approval/input requests |
 
 #### Methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `RespondToElicitation` | `s` | Send answer to a pending approval/input request |
+| `RespondToElicitation` | `s` | Send answer to the oldest pending approval/input request |
+| `RespondToElicitationById` | `ss` | Send answer to a specific pending request id |
 
 #### Signals
 
 | Signal | Signature | Description |
 |--------|-----------|-------------|
 | `ElicitationRequested` | `sas` | `prompt`, `options` - agent needs user input |
+| `ElicitationRequestedWithId` | `ssas` | `request_id`, `prompt`, `options` - id-aware request signal |
 | `Notification` | `s` | `message` - notification from a compatible hook |
 
 ### Introspect

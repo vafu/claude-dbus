@@ -35,11 +35,11 @@ agent-dbus
       +-- ObjectManager at /io/github/AgentDBus
       |
       +-- blocking PermissionRequest/Elicitation events:
-            waits for RespondToElicitation D-Bus method call from AGS,
+            waits for RespondToElicitation or RespondToElicitationById D-Bus method call from AGS,
             then writes response JSON/string back to the hook caller
 ```
 
-Input is exclusively via Unix socket. D-Bus is output-only, except for `RespondToElicitation`, which supplies responses to pending approval/input prompts.
+Input is exclusively via Unix socket. D-Bus is output-only, except for `RespondToElicitation` and `RespondToElicitationById`, which supply responses to pending approval/input prompts.
 
 ## D-Bus Interface
 
@@ -69,20 +69,26 @@ Input is exclusively via Unix socket. D-Bus is output-only, except for `RespondT
 | `FiveHourResetsAt` | `t` | Unix timestamp for the 5-hour usage reset |
 | `SevenDayUsagePct` | `d` | Current 7-day usage percentage, when available |
 | `SevenDayResetsAt` | `t` | Unix timestamp for the 7-day usage reset |
-| `PendingPrompt` | `s` | Prompt for the current pending request |
-| `PendingOptions` | `as` | Options for the current pending request |
+| `PendingPrompt` | `s` | Prompt for the oldest pending request, for compatibility |
+| `PendingOptions` | `as` | Options for the oldest pending request, for compatibility |
+| `PendingCount` | `u` | Number of pending approval/input requests |
+| `PendingRequestIds` | `as` | Request ids for all pending approval/input requests |
+| `PendingPrompts` | `as` | Prompts for all pending approval/input requests |
+| `PendingOptionsList` | `aas` | Options for all pending approval/input requests |
 
 #### Methods
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `RespondToElicitation` | `s answer` | Called by AGS when user clicks an approval/input button |
+| `RespondToElicitation` | `s answer` | Called by AGS to answer the oldest pending approval/input request |
+| `RespondToElicitationById` | `s request_id, s answer` | Called by AGS to answer a specific pending request |
 
 #### Signals
 
 | Signal | Signature | Description |
 |--------|-----------|-------------|
 | `ElicitationRequested` | `s prompt, as options` | Show approval/input popup |
+| `ElicitationRequestedWithId` | `s request_id, s prompt, as options` | Show approval/input popup with stable request id |
 | `Notification` | `s message` | Notification from compatible hook input |
 
 ## Unix Socket
@@ -106,10 +112,11 @@ Protocol:
 
 ## Terminal Responses
 
-Use `agent-respond <agent> <session-id> <answer>` when the UI is unavailable:
+Use `agent-respond <agent> <session-id> <answer>` when the UI is unavailable. Add `--request-id <id>` to answer a specific pending request:
 
 ```bash
 agent-respond codex 019dea3f-6d06-79b3-96c5-35f0e602c169 Allow
+agent-respond codex 019dea3f-6d06-79b3-96c5-35f0e602c169 --request-id req-2 Deny
 ```
 
 ## Supported Hook Events
