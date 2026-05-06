@@ -205,7 +205,7 @@ pub async fn handle_hook_connection(
                 build_permission_options(data),
             )
             .await;
-            if let Some(decision) = permission_response(&response) {
+            if let Some(decision) = permission_response(data, &response) {
                 let _ = stream.write_all(decision.as_bytes()).await;
             } else {
                 info!(agent = %agent_name, session_id = %session_id, "permission request ended without an explicit response");
@@ -328,26 +328,31 @@ fn build_permission_prompt(data: &serde_json::Value) -> String {
 }
 
 fn build_permission_options(data: &serde_json::Value) -> Vec<String> {
-    let mut options: Vec<String> = data["permission_suggestions"]
+    let mut options = vec!["Allow".to_string()];
+    let mut always_allow_options: Vec<String> = data["permission_suggestions"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|s| {
-            let behavior = s["behavior"].as_str()?;
-            let dest = s["destination"].as_str().unwrap_or("");
-            if behavior == "allow" {
-                Some(format!("Allow ({})", dest))
+            if s["behavior"].as_str()? == "allow" {
+                Some(permission_suggestion_label(s))
             } else {
                 None
             }
         })
         .collect();
-    if options.is_empty() {
-        options.push("Allow".to_string());
-    }
-    options.push("Always allow".to_string());
+    options.append(&mut always_allow_options);
     options.push("Deny".to_string());
     options
+}
+
+fn permission_suggestion_label(suggestion: &serde_json::Value) -> String {
+    let dest = suggestion["destination"].as_str().unwrap_or("");
+    if dest.is_empty() {
+        "Always allow".to_string()
+    } else {
+        format!("Always allow ({dest})")
+    }
 }
 
 fn build_elicitation_options(data: &serde_json::Value) -> Vec<String> {
@@ -361,7 +366,7 @@ fn build_elicitation_options(data: &serde_json::Value) -> Vec<String> {
         })
         .unwrap_or_default();
 
-    if (supports_always_allow(data) || is_approval_elicitation(&options))
+    if supports_always_allow(data)
         && has_allow_option(&options)
         && !has_always_allow_option(&options)
     {
@@ -373,10 +378,6 @@ fn build_elicitation_options(data: &serde_json::Value) -> Vec<String> {
     }
 
     options
-}
-
-fn is_approval_elicitation(options: &[String]) -> bool {
-    has_allow_option(options) && options.iter().any(|option| is_decline_option(option))
 }
 
 fn supports_always_allow(data: &serde_json::Value) -> bool {
@@ -418,18 +419,66 @@ fn is_decline_option(option: &str) -> bool {
     normalized == "deny" || normalized == "decline" || normalized == "cancel"
 }
 
-fn permission_response(answer: &str) -> Option<&'static str> {
-    if answer.starts_with("Allow") || answer.starts_with("Always allow") {
+fn permission_response(data: &serde_json::Value, answer: &str) -> Option<String> {
+    let answer = answer.trim();
+    if is_always_allow_answer(answer) {
+        let updated_permissions = permission_suggestion_for_answer(data, answer)
+            .map(|suggestion| vec![suggestion.clone()])
+            .unwrap_or_default();
+        Some(permission_allow_response(updated_permissions))
+    } else if is_allow_answer(answer) {
+        Some(permission_allow_response(Vec::new()))
+    } else if answer.eq_ignore_ascii_case("deny") || answer.starts_with("Deny") {
         Some(
-            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#,
-        )
-    } else if answer.starts_with("Deny") {
-        Some(
-            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"User denied via popup"}}}"#,
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"User denied via popup"}}}"#
+                .to_string(),
         )
     } else {
         None
     }
+}
+
+fn is_allow_answer(answer: &str) -> bool {
+    answer.eq_ignore_ascii_case("allow") || answer.starts_with("Allow ")
+}
+
+fn is_always_allow_answer(answer: &str) -> bool {
+    let normalized = answer.to_ascii_lowercase();
+    normalized == "always allow" || normalized.starts_with("always allow ")
+}
+
+fn permission_suggestion_for_answer<'a>(
+    data: &'a serde_json::Value,
+    answer: &str,
+) -> Option<&'a serde_json::Value> {
+    let suggestions = data["permission_suggestions"].as_array()?;
+    let answer = answer.trim();
+    suggestions
+        .iter()
+        .find(|suggestion| {
+            suggestion["behavior"].as_str() == Some("allow")
+                && permission_suggestion_label(suggestion).eq_ignore_ascii_case(answer)
+        })
+        .or_else(|| {
+            suggestions
+                .iter()
+                .find(|suggestion| suggestion["behavior"].as_str() == Some("allow"))
+        })
+}
+
+fn permission_allow_response(updated_permissions: Vec<serde_json::Value>) -> String {
+    let mut decision = serde_json::json!({ "behavior": "allow" });
+    if !updated_permissions.is_empty() {
+        decision["updatedPermissions"] = serde_json::Value::Array(updated_permissions);
+    }
+
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": decision
+        }
+    })
+    .to_string()
 }
 
 fn model_name(data: &serde_json::Value) -> String {
@@ -682,17 +731,14 @@ mod tests {
     }
 
     #[test]
-    fn elicitation_options_include_always_allow_for_approval_choices_without_persist_hint() {
+    fn elicitation_options_do_not_add_always_allow_without_persist_hint() {
         let data = json!({
             "elicitation": {
                 "options": ["Allow", "Decline"]
             }
         });
 
-        assert_eq!(
-            build_elicitation_options(&data),
-            vec!["Allow", "Always allow", "Decline"]
-        );
+        assert_eq!(build_elicitation_options(&data), vec!["Allow", "Decline"]);
     }
 
     #[test]
@@ -708,21 +754,70 @@ mod tests {
 
     #[test]
     fn permission_response_accepts_always_allow() {
+        let data = json!({
+            "permission_suggestions": [
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "npm test" }],
+                    "behavior": "allow",
+                    "destination": "localSettings"
+                }
+            ]
+        });
+        let response: serde_json::Value =
+            serde_json::from_str(&permission_response(&data, "Always allow").unwrap()).unwrap();
+
         assert_eq!(
-            permission_response("Always allow"),
-            Some(
-                r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
-            )
+            response["hookSpecificOutput"]["decision"]["updatedPermissions"][0],
+            data["permission_suggestions"][0]
         );
     }
 
     #[test]
     fn permission_options_include_always_allow() {
-        let data = json!({});
+        let data = json!({
+            "permission_suggestions": [
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "npm test" }],
+                    "behavior": "allow",
+                    "destination": "localSettings"
+                }
+            ]
+        });
 
         assert_eq!(
             build_permission_options(&data),
-            vec!["Allow", "Always allow", "Deny"]
+            vec!["Allow", "Always allow (localSettings)", "Deny"]
+        );
+    }
+
+    #[test]
+    fn permission_response_maps_specific_always_allow_option() {
+        let data = json!({
+            "permission_suggestions": [
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "npm test" }],
+                    "behavior": "allow",
+                    "destination": "localSettings"
+                },
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "npm test" }],
+                    "behavior": "allow",
+                    "destination": "userSettings"
+                }
+            ]
+        });
+        let response: serde_json::Value = serde_json::from_str(
+            &permission_response(&data, "Always allow (userSettings)").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response["hookSpecificOutput"]["decision"]["updatedPermissions"][0],
+            data["permission_suggestions"][1]
         );
     }
 }
