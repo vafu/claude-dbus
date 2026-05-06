@@ -1,6 +1,9 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
+use agent_dbus::constants::socket_path;
+use agent_dbus::path::agent_session_node_key;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (agent, event) = parse_args();
@@ -25,9 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let msg_bytes = serde_json::to_vec(&msg)?;
 
-    let socket_path = std::env::var("XDG_RUNTIME_DIR")
-        .map(|d| format!("{}/agent-dbus.sock", d))
-        .unwrap_or_else(|_| "/tmp/agent-dbus.sock".to_string());
+    let socket_path = socket_path();
 
     let mut stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
@@ -112,7 +113,7 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
         return;
     };
 
-    let key = format!("{}/{}", safe_segment(agent), safe_segment(session_id));
+    let key = agent_session_node_key(agent, session_id);
     let remove = event == "SessionEnd";
 
     let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
@@ -134,23 +135,5 @@ async fn update_locus_window_session_link(
     } else {
         let _ = locus.set_property(&target, "kind", "agent-session").await;
         let _ = locus.set_link(&source, "agent-session", &target).await;
-    }
-}
-
-fn safe_segment(value: &str) -> String {
-    let safe: String = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if safe.is_empty() {
-        "unknown".to_string()
-    } else {
-        safe
     }
 }

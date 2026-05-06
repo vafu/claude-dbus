@@ -3,17 +3,42 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Duration, sleep};
-use tracing::info;
+use tokio::time::{Duration, sleep, timeout};
+use tracing::{info, warn};
 
 use crate::dbus::{
     PendingRequest, SessionObject, create_session, emit_elicitation, emit_elicitation_with_id,
-    emit_notification, session_path, update_session,
+    emit_notification, update_session,
 };
 use crate::types::SessionState;
 use crate::{CodexSessionParents, EndedSessions};
+use agent_dbus::path::{session_key, session_path};
+
+mod metrics;
+mod permission;
+
+#[cfg(test)]
+use metrics::codex_context_pct;
+use metrics::{apply_usage_limits, context_pct};
+use permission::{
+    build_elicitation_options, build_permission_options, build_permission_prompt,
+    permission_response,
+};
 
 static NEXT_PENDING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_HOOK_MESSAGE_BYTES: u64 = 1024 * 1024;
+const HOOK_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_ELICITATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[derive(serde::Deserialize)]
+struct HookMessage {
+    agent: Option<String>,
+    agent_name: Option<String>,
+    event: Option<String>,
+    #[serde(default)]
+    data: serde_json::Value,
+    parent_pid: Option<u64>,
+}
 
 pub fn start_codex_compact_watcher(conn: zbus::Connection) {
     let Some(path) = codex_log_file() else {
@@ -49,6 +74,50 @@ pub fn start_codex_compact_watcher(conn: zbus::Connection) {
             for line in chunk.lines() {
                 if let Some(event) = parse_codex_compact_log_line(line) {
                     apply_codex_compact_log_event(&conn, event).await;
+                }
+            }
+        }
+    });
+}
+
+pub fn start_codex_parent_watcher(
+    conn: zbus::Connection,
+    ended: EndedSessions,
+    codex_session_parents: CodexSessionParents,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(5)).await;
+            let watched: Vec<(String, u32)> = codex_session_parents
+                .lock()
+                .await
+                .iter()
+                .map(|(key, pid)| (key.clone(), *pid))
+                .collect();
+
+            for (key, parent_pid) in watched {
+                if process_exists(parent_pid) {
+                    continue;
+                }
+                let Some((agent_name, session_id)) = key.split_once(':') else {
+                    codex_session_parents.lock().await.remove(&key);
+                    continue;
+                };
+                let still_current =
+                    codex_session_parents.lock().await.get(&key).copied() == Some(parent_pid);
+                if still_current {
+                    remove_session(
+                        &conn,
+                        &ended,
+                        &codex_session_parents,
+                        agent_name,
+                        session_id,
+                    )
+                    .await;
+                    info!(
+                        session_id,
+                        parent_pid, "removed codex session after parent process exited"
+                    );
                 }
             }
         }
@@ -93,18 +162,22 @@ fn parse_thread_id(line: &str) -> Option<&str> {
 }
 
 async fn apply_codex_compact_log_event(conn: &zbus::Connection, event: CodexCompactLogEvent) {
-    let _ = update_session(conn, "codex", &event.session_id, |d| {
-        if event.active {
-            d.state = SessionState::Compacting;
-            d.task_complete = false;
-            clear_pending_if_not_waiting(d);
-        } else if d.state == SessionState::Compacting {
-            d.state = SessionState::Idle;
-            d.task_complete = true;
-            clear_pending_if_not_waiting(d);
-        }
-    })
-    .await;
+    log_zbus_result(
+        update_session(conn, "codex", &event.session_id, |d| {
+            if event.active {
+                d.state = SessionState::Compacting;
+                d.task_complete = false;
+                clear_pending_if_not_waiting(d);
+            } else if d.state == SessionState::Compacting {
+                d.state = SessionState::Idle;
+                d.task_complete = true;
+                clear_pending_if_not_waiting(d);
+            }
+        })
+        .await,
+        "update_session",
+        &event.session_id,
+    );
 }
 
 pub async fn handle_hook_connection(
@@ -114,7 +187,26 @@ pub async fn handle_hook_connection(
     codex_session_parents: CodexSessionParents,
 ) {
     let mut buf = Vec::new();
-    if stream.read_to_end(&mut buf).await.is_err() {
+    let read_result = timeout(
+        HOOK_READ_TIMEOUT,
+        (&mut stream)
+            .take(MAX_HOOK_MESSAGE_BYTES + 1)
+            .read_to_end(&mut buf),
+    )
+    .await;
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            warn!(%err, "failed to read hook message");
+            return;
+        }
+        Err(_) => {
+            warn!("timed out reading hook message");
+            return;
+        }
+    }
+    if buf.len() as u64 > MAX_HOOK_MESSAGE_BYTES {
+        warn!(bytes = buf.len(), "hook message exceeded maximum size");
         return;
     }
     let raw = match std::str::from_utf8(&buf) {
@@ -122,7 +214,7 @@ pub async fn handle_hook_connection(
         Err(_) => return,
     };
 
-    let msg: serde_json::Value = match serde_json::from_str(&raw) {
+    let msg: HookMessage = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             info!("Failed to parse hook message: {}", e);
@@ -130,11 +222,12 @@ pub async fn handle_hook_connection(
         }
     };
 
-    let data = &msg["data"];
-    let event = msg["event"].as_str().unwrap_or("").to_string();
-    let agent_name = msg["agent"]
-        .as_str()
-        .or_else(|| msg["agent_name"].as_str())
+    let data = &msg.data;
+    let event = msg.event.unwrap_or_default();
+    let agent_name = msg
+        .agent
+        .as_deref()
+        .or(msg.agent_name.as_deref())
         .or_else(|| data["agent_name"].as_str())
         .unwrap_or("agent")
         .to_string();
@@ -143,14 +236,10 @@ pub async fn handle_hook_connection(
     tracing::debug!(data = %data, "hook data");
 
     maybe_watch_codex_parent(
-        &conn,
-        &ended,
         &codex_session_parents,
         &agent_name,
         &session_id,
-        msg["parent_pid"]
-            .as_u64()
-            .and_then(|pid| u32::try_from(pid).ok()),
+        msg.parent_pid.and_then(|pid| u32::try_from(pid).ok()),
     )
     .await;
 
@@ -171,44 +260,60 @@ pub async fn handle_hook_connection(
                 .to_string();
             let cwd = data["cwd"].as_str().unwrap_or("").to_string();
             let cost_usd = data["cost"]["total_cost_usd"].as_f64().unwrap_or(0.0);
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                if let Some(ctx_pct) = context_pct(data) {
-                    d.context_pct = ctx_pct;
-                }
-                d.model_name = model;
-                d.cwd = cwd;
-                d.cost_usd = cost_usd;
-                apply_usage_limits(d, &agent_name, &session_id, data);
-                if d.state == SessionState::NoSession {
-                    d.state = SessionState::Idle;
-                }
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    if let Some(ctx_pct) = context_pct(data) {
+                        d.context_pct = ctx_pct;
+                    }
+                    d.model_name = model;
+                    d.cwd = cwd;
+                    d.cost_usd = cost_usd;
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                    if d.state == SessionState::NoSession {
+                        d.state = SessionState::Idle;
+                    }
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "SessionStart" => {
-            let _ = create_session(&conn, &agent_name, &session_id).await;
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.state = SessionState::Idle;
-                d.model_name = model_name(data);
-                d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
-                apply_usage_limits(d, &agent_name, &session_id, data);
-                d.task_complete = false;
-                clear_pending_if_not_waiting(d);
-            })
-            .await;
+            log_zbus_result(
+                create_session(&conn, &agent_name, &session_id).await,
+                "create_session",
+                &session_id,
+            );
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::Idle;
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                    d.task_complete = false;
+                    clear_pending_if_not_waiting(d);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "Stop" => {
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.state = SessionState::Idle;
-                d.task_complete = true;
-                clear_pending_if_not_waiting(d);
-                d.model_name = model_name(data);
-                d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
-                apply_usage_limits(d, &agent_name, &session_id, data);
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::Idle;
+                    d.task_complete = true;
+                    clear_pending_if_not_waiting(d);
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "SessionEnd" => {
@@ -223,43 +328,59 @@ pub async fn handle_hook_connection(
         }
 
         "TaskCompleted" => {
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.task_complete = true;
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.task_complete = true;
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "UserPromptSubmit" => {
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.state = SessionState::Thinking;
-                d.task_complete = false;
-                clear_pending_if_not_waiting(d);
-                d.model_name = model_name(data);
-                d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
-                apply_usage_limits(d, &agent_name, &session_id, data);
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::Thinking;
+                    d.task_complete = false;
+                    clear_pending_if_not_waiting(d);
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "PreToolUse" => {
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.state = SessionState::ToolUse;
-                d.model_name = model_name(data);
-                d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
-                apply_usage_limits(d, &agent_name, &session_id, data);
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::ToolUse;
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "PostToolUse" => {
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.state = SessionState::Thinking;
-                clear_pending_if_not_waiting(d);
-                d.model_name = model_name(data);
-                d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
-                apply_usage_limits(d, &agent_name, &session_id, data);
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::Thinking;
+                    clear_pending_if_not_waiting(d);
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "Notify" | "Notification" => {
@@ -271,25 +392,37 @@ pub async fn handle_hook_connection(
                 .await
             {
                 let emitter = iface_ref.signal_emitter();
-                let _ = emit_notification(emitter, &message).await;
+                log_zbus_result(
+                    emit_notification(emitter, &message).await,
+                    "emit_notification",
+                    &session_id,
+                );
             }
         }
 
         "PreCompact" => {
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.state = SessionState::Compacting;
-                clear_pending_if_not_waiting(d);
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::Compacting;
+                    clear_pending_if_not_waiting(d);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "PermissionRequest" => {
-            let _ = update_session(&conn, &agent_name, &session_id, |d| {
-                d.model_name = model_name(data);
-                d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
-                apply_usage_limits(d, &agent_name, &session_id, data);
-            })
-            .await;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
             let response = handle_elicitation_event(
                 &conn,
                 &agent_name,
@@ -299,7 +432,9 @@ pub async fn handle_hook_connection(
             )
             .await;
             if let Some(decision) = permission_response(data, &response) {
-                let _ = stream.write_all(decision.as_bytes()).await;
+                if let Err(err) = stream.write_all(decision.as_bytes()).await {
+                    warn!(%err, "failed to write permission response");
+                }
             } else {
                 info!(agent = %agent_name, session_id = %session_id, "permission request ended without an explicit response");
             }
@@ -314,7 +449,9 @@ pub async fn handle_hook_connection(
             let options = build_elicitation_options(data);
             let response =
                 handle_elicitation_event(&conn, &agent_name, &session_id, prompt, options).await;
-            let _ = stream.write_all(response.as_bytes()).await;
+            if let Err(err) = stream.write_all(response.as_bytes()).await {
+                warn!(%err, "failed to write elicitation response");
+            }
         }
 
         other => {
@@ -324,8 +461,6 @@ pub async fn handle_hook_connection(
 }
 
 async fn maybe_watch_codex_parent(
-    conn: &zbus::Connection,
-    ended: &EndedSessions,
     codex_session_parents: &CodexSessionParents,
     agent_name: &str,
     session_id: &str,
@@ -345,40 +480,6 @@ async fn maybe_watch_codex_parent(
         return;
     }
     parents.insert(key.clone(), parent_pid);
-    drop(parents);
-
-    let conn = conn.clone();
-    let ended = ended.clone();
-    let codex_session_parents = codex_session_parents.clone();
-    let agent_name = agent_name.to_string();
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(5)).await;
-            if process_exists(parent_pid) {
-                continue;
-            }
-
-            let still_current =
-                codex_session_parents.lock().await.get(&key).copied() == Some(parent_pid);
-            if still_current {
-                remove_session(
-                    &conn,
-                    &ended,
-                    &codex_session_parents,
-                    &agent_name,
-                    &session_id,
-                )
-                .await;
-                info!(
-                    session_id = %session_id,
-                    parent_pid,
-                    "removed codex session after parent process exited"
-                );
-            }
-            break;
-        }
-    });
 }
 
 async fn remove_session(
@@ -392,215 +493,30 @@ async fn remove_session(
     ended.lock().await.insert(key.clone());
     codex_session_parents.lock().await.remove(&key);
     let path = session_path(agent_name, session_id);
-    let _ = conn.object_server().remove::<SessionObject, _>(&path).await;
+    if let Ok(iface_ref) = conn
+        .object_server()
+        .interface::<_, SessionObject>(&path)
+        .await
+    {
+        let cancelled = iface_ref.get_mut().await.cancel_pending_requests();
+        if cancelled > 0 {
+            info!(%session_id, cancelled, "cancelled pending requests for removed session");
+        }
+    }
+    match conn.object_server().remove::<SessionObject, _>(&path).await {
+        Ok(_) => {}
+        Err(err) => warn!(%err, %session_id, "failed to remove session object"),
+    }
 }
 
 fn process_exists(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
-fn build_permission_prompt(data: &serde_json::Value) -> String {
-    let tool_name = data["tool_name"].as_str().unwrap_or("unknown tool");
-    let input_desc = if let Some(desc) = data["tool_input"]["description"].as_str() {
-        desc.to_string()
-    } else if let Some(cmd) = data["tool_input"]["command"].as_str() {
-        format!("`{}`", cmd.chars().take(120).collect::<String>())
-    } else if let Some(path) = data["tool_input"]["file_path"].as_str() {
-        format!("`{}`", path)
-    } else {
-        serde_json::to_string(&data["tool_input"]).unwrap_or_default()
-    };
-    format!("Allow {}?\n{}", tool_name, input_desc)
-}
-
-fn build_permission_options(data: &serde_json::Value) -> Vec<String> {
-    let mut options = vec!["Allow".to_string()];
-    let mut always_allow_options: Vec<String> = data["permission_suggestions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|s| {
-            if s["behavior"].as_str()? == "allow" {
-                Some(permission_suggestion_label(s))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if always_allow_options.is_empty() && is_codex_permission_request(data) {
-        always_allow_options.push("Always allow".to_string());
+fn log_zbus_result(result: zbus::Result<()>, action: &str, session_id: &str) {
+    if let Err(err) = result {
+        warn!(%err, %session_id, action, "D-Bus operation failed");
     }
-    options.append(&mut always_allow_options);
-    options.push("Deny".to_string());
-    options
-}
-
-fn is_codex_permission_request(data: &serde_json::Value) -> bool {
-    data["hook_event_name"].as_str() == Some("PermissionRequest")
-        && data["transcript_path"].as_str().is_some()
-        && data["permission_mode"].as_str().is_some()
-}
-
-fn permission_suggestion_label(suggestion: &serde_json::Value) -> String {
-    let dest = suggestion["destination"].as_str().unwrap_or("");
-    if dest.is_empty() {
-        "Always allow".to_string()
-    } else {
-        format!("Always allow ({dest})")
-    }
-}
-
-fn build_elicitation_options(data: &serde_json::Value) -> Vec<String> {
-    let mut options: Vec<String> = data["elicitation"]["options"]
-        .as_array()
-        .or_else(|| data["options"].as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v["value"].as_str().or_else(|| v.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if supports_always_allow(data)
-        && has_allow_option(&options)
-        && !has_always_allow_option(&options)
-    {
-        let insert_at = options
-            .iter()
-            .position(|option| is_decline_option(option))
-            .unwrap_or(options.len());
-        options.insert(insert_at, "Always allow".to_string());
-    }
-
-    options
-}
-
-fn supports_always_allow(data: &serde_json::Value) -> bool {
-    [
-        &data["_meta"]["persist"],
-        &data["elicitation"]["_meta"]["persist"],
-        &data["meta"]["persist"],
-        &data["elicitation"]["meta"]["persist"],
-    ]
-    .iter()
-    .any(|persist| persist_value_includes(persist, "always"))
-}
-
-fn persist_value_includes(value: &serde_json::Value, needle: &str) -> bool {
-    value
-        .as_str()
-        .is_some_and(|s| s.eq_ignore_ascii_case(needle))
-        || value.as_array().is_some_and(|arr| {
-            arr.iter()
-                .any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(needle)))
-        })
-}
-
-fn has_allow_option(options: &[String]) -> bool {
-    options.iter().any(|option| {
-        let normalized = option.trim().to_ascii_lowercase();
-        normalized == "allow" || normalized == "accept"
-    })
-}
-
-fn has_always_allow_option(options: &[String]) -> bool {
-    options
-        .iter()
-        .any(|option| option.trim().eq_ignore_ascii_case("always allow"))
-}
-
-fn is_decline_option(option: &str) -> bool {
-    let normalized = option.trim().to_ascii_lowercase();
-    normalized == "deny" || normalized == "decline" || normalized == "cancel"
-}
-
-fn permission_response(data: &serde_json::Value, answer: &str) -> Option<String> {
-    let answer = answer.trim();
-    if is_always_allow_answer(answer) {
-        if let Some(prefix_rule) = codex_prefix_rule(data) {
-            Some(permission_allow_response_with_exec_policy_amendment(
-                prefix_rule.clone(),
-            ))
-        } else {
-            permission_suggestion_for_answer(data, answer)
-                .map(|suggestion| permission_allow_response(vec![suggestion]))
-        }
-    } else if is_allow_answer(answer) {
-        Some(permission_allow_response(Vec::new()))
-    } else if answer.eq_ignore_ascii_case("deny") || answer.starts_with("Deny") {
-        Some(
-            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"User denied via popup"}}}"#
-                .to_string(),
-        )
-    } else {
-        None
-    }
-}
-
-fn codex_prefix_rule(data: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    if !is_codex_permission_request(data) {
-        return None;
-    }
-    data["prefix_rule"].as_array()
-}
-
-fn is_allow_answer(answer: &str) -> bool {
-    answer.eq_ignore_ascii_case("allow") || answer.starts_with("Allow ")
-}
-
-fn is_always_allow_answer(answer: &str) -> bool {
-    let normalized = answer.to_ascii_lowercase();
-    normalized == "always allow" || normalized.starts_with("always allow ")
-}
-
-fn permission_suggestion_for_answer<'a>(
-    data: &'a serde_json::Value,
-    answer: &str,
-) -> Option<serde_json::Value> {
-    let suggestions = data["permission_suggestions"].as_array()?;
-    let answer = answer.trim();
-    suggestions
-        .iter()
-        .find(|suggestion| {
-            suggestion["behavior"].as_str() == Some("allow")
-                && permission_suggestion_label(suggestion).eq_ignore_ascii_case(answer)
-        })
-        .or_else(|| {
-            suggestions
-                .iter()
-                .find(|suggestion| suggestion["behavior"].as_str() == Some("allow"))
-        })
-        .cloned()
-}
-
-fn permission_allow_response(updated_permissions: Vec<serde_json::Value>) -> String {
-    let mut decision = serde_json::json!({ "behavior": "allow" });
-    if !updated_permissions.is_empty() {
-        decision["updatedPermissions"] = serde_json::Value::Array(updated_permissions);
-    }
-
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": decision
-        }
-    })
-    .to_string()
-}
-
-fn permission_allow_response_with_exec_policy_amendment(
-    exec_policy_amendment: Vec<serde_json::Value>,
-) -> String {
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
-            "decision": {
-                "behavior": "allow",
-                "execPolicyAmendment": exec_policy_amendment
-            }
-        }
-    })
-    .to_string()
 }
 
 fn model_name(data: &serde_json::Value) -> String {
@@ -609,163 +525,6 @@ fn model_name(data: &serde_json::Value) -> String {
         .or_else(|| data["model"].as_str())
         .unwrap_or("unknown")
         .to_string()
-}
-
-fn session_key(agent_name: &str, session_id: &str) -> String {
-    format!("{}:{}", agent_name, session_id)
-}
-
-fn apply_usage_limits(
-    session: &mut SessionObject,
-    agent_name: &str,
-    session_id: &str,
-    data: &serde_json::Value,
-) {
-    let fallback = if agent_name == "codex" {
-        codex_session_metrics(session_id)
-    } else {
-        None
-    };
-
-    if let Some(pct) = context_pct(data).or_else(|| fallback.as_ref().and_then(|m| m.context_pct)) {
-        session.context_pct = pct;
-    }
-
-    if let Some((pct, resets_at)) = usage_limit(data, "primary")
-        .or_else(|| usage_limit(data, "five_hour"))
-        .or_else(|| usage_limit(data, "fiveHour"))
-        .or_else(|| usage_limit(data, "5h"))
-        .or(fallback.as_ref().and_then(|metrics| metrics.five_hour))
-    {
-        session.five_hour_usage_pct = pct;
-        session.five_hour_resets_at = resets_at;
-    }
-
-    if let Some((pct, resets_at)) = usage_limit(data, "secondary")
-        .or_else(|| usage_limit(data, "seven_day"))
-        .or_else(|| usage_limit(data, "sevenDay"))
-        .or_else(|| usage_limit(data, "7d"))
-        .or(fallback.as_ref().and_then(|metrics| metrics.seven_day))
-    {
-        session.seven_day_usage_pct = pct;
-        session.seven_day_resets_at = resets_at;
-    }
-}
-
-fn context_pct(data: &serde_json::Value) -> Option<f64> {
-    data["context_window"]["used_percentage"]
-        .as_f64()
-        .or_else(|| data["context_window"]["used_percent"].as_f64())
-        .or_else(|| data["context"]["used_percentage"].as_f64())
-        .or_else(|| data["context"]["used_percent"].as_f64())
-        .or_else(|| data["context_pct"].as_f64())
-}
-
-fn usage_limit(data: &serde_json::Value, key: &str) -> Option<(f64, u64)> {
-    let limit = data["rate_limits"][key]
-        .as_object()
-        .map(|_| &data["rate_limits"][key])
-        .or_else(|| data["usage"][key].as_object().map(|_| &data["usage"][key]))
-        .or_else(|| {
-            data["limits"][key]
-                .as_object()
-                .map(|_| &data["limits"][key])
-        })?;
-
-    let pct = limit["used_percent"]
-        .as_f64()
-        .or_else(|| limit["usage_percent"].as_f64())
-        .or_else(|| limit["used_pct"].as_f64())
-        .or_else(|| limit["percent"].as_f64())?;
-    let resets_at = limit["resets_at"]
-        .as_u64()
-        .or_else(|| limit["reset_at"].as_u64())
-        .or_else(|| limit["reset_time"].as_u64())
-        .unwrap_or(0);
-
-    Some((pct, resets_at))
-}
-
-#[derive(Clone, Copy)]
-struct SessionMetrics {
-    context_pct: Option<f64>,
-    five_hour: Option<(f64, u64)>,
-    seven_day: Option<(f64, u64)>,
-}
-
-fn codex_session_metrics(session_id: &str) -> Option<SessionMetrics> {
-    let path = codex_session_file(session_id)?;
-    let contents = std::fs::read_to_string(path).ok()?;
-
-    contents.lines().rev().find_map(|line| {
-        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
-        let payload = &entry["payload"];
-        if entry["type"].as_str()? != "event_msg" || payload["type"].as_str()? != "token_count" {
-            return None;
-        }
-
-        let data = serde_json::json!({ "rate_limits": payload["rate_limits"].clone() });
-        Some(SessionMetrics {
-            context_pct: codex_context_pct(payload),
-            five_hour: usage_limit(&data, "primary"),
-            seven_day: usage_limit(&data, "secondary"),
-        })
-    })
-}
-
-fn codex_context_pct(token_count_payload: &serde_json::Value) -> Option<f64> {
-    context_pct(token_count_payload).or_else(|| {
-        let window = token_count_payload["info"]["model_context_window"].as_f64()?;
-        if window <= 0.0 {
-            return None;
-        }
-
-        let used = token_count_payload["info"]["last_token_usage"]["total_tokens"]
-            .as_f64()
-            .or_else(|| token_count_payload["info"]["last_token_usage"]["input_tokens"].as_f64())?;
-        Some((used / window) * 100.0)
-    })
-}
-
-fn codex_session_file(session_id: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let sessions_dir = Path::new(&home).join(".codex/sessions");
-    let mut matches = Vec::new();
-    collect_matching_codex_sessions(&sessions_dir, session_id, &mut matches);
-    matches.into_iter().max_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-    })
-}
-
-fn collect_matching_codex_sessions(dir: &Path, session_id: &str, matches: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        if file_type.is_dir() {
-            collect_matching_codex_sessions(&path, session_id, matches);
-            continue;
-        }
-
-        if file_type.is_file()
-            && path.extension().is_some_and(|ext| ext == "jsonl")
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(session_id))
-        {
-            matches.push(path);
-        }
-    }
 }
 
 async fn handle_elicitation_event(
@@ -779,10 +538,13 @@ async fn handle_elicitation_event(
     info!(agent = %agent_name, session_id = %session_id, prompt = %prompt, ?options, "elicitation");
 
     let path = session_path(agent_name, session_id);
-    let _ = conn
+    if let Err(err) = conn
         .object_server()
         .at(&path, SessionObject::new(agent_name))
-        .await;
+        .await
+    {
+        warn!(%err, %session_id, "failed to ensure session object for elicitation");
+    }
     let iface_ref = match conn
         .object_server()
         .interface::<_, SessionObject>(&path)
@@ -796,35 +558,42 @@ async fn handle_elicitation_event(
     let request_id = next_pending_request_id();
     {
         let mut iface = iface_ref.get_mut().await;
-        iface.pending_requests.push(PendingRequest {
+        iface.push_pending_request(PendingRequest {
             id: request_id.clone(),
             prompt: prompt.clone(),
             options: options.clone(),
             tx,
         });
-        iface.requires_attention = true;
     }
 
     let emitter = iface_ref.signal_emitter();
     {
         let iface = iface_ref.get().await;
-        let _ = iface.pending_prompt_changed(emitter).await;
-        let _ = iface.pending_options_changed(emitter).await;
-        let _ = iface.pending_count_changed(emitter).await;
-        let _ = iface.pending_request_ids_changed(emitter).await;
-        let _ = iface.pending_prompts_changed(emitter).await;
-        let _ = iface.pending_options_list_changed(emitter).await;
-        let _ = iface.requires_attention_changed(emitter).await;
+        if let Err(err) = iface.emit_pending_changed(emitter).await {
+            warn!(%err, %session_id, "failed to emit pending request properties");
+        }
     }
 
     let option_refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
-    let _ = emit_elicitation(emitter, &prompt, &option_refs).await;
-    let _ = emit_elicitation_with_id(emitter, &request_id, &prompt, &option_refs).await;
+    log_zbus_result(
+        emit_elicitation(emitter, &prompt, &option_refs).await,
+        "emit_elicitation",
+        session_id,
+    );
+    log_zbus_result(
+        emit_elicitation_with_id(emitter, &request_id, &prompt, &option_refs).await,
+        "emit_elicitation_with_id",
+        session_id,
+    );
 
-    let answer = match rx.await {
-        Ok(answer) => answer,
-        Err(_) => {
+    let answer = match timeout(elicitation_timeout(), rx).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => {
             info!(agent = %agent_name, session_id = %session_id, "elicitation waiter was dropped before an explicit response");
+            String::new()
+        }
+        Err(_) => {
+            warn!(agent = %agent_name, session_id = %session_id, request_id = %request_id, "elicitation timed out");
             String::new()
         }
     };
@@ -832,25 +601,23 @@ async fn handle_elicitation_event(
 
     {
         let mut iface = iface_ref.get_mut().await;
-        if let Some(index) = iface
-            .pending_requests
-            .iter()
-            .position(|request| request.id == request_id)
-        {
-            iface.pending_requests.remove(index);
-            iface.requires_attention = !iface.pending_requests.is_empty();
-        }
+        iface.remove_pending_request(&request_id);
     }
     let iface = iface_ref.get().await;
-    let _ = iface.requires_attention_changed(emitter).await;
-    let _ = iface.pending_prompt_changed(emitter).await;
-    let _ = iface.pending_options_changed(emitter).await;
-    let _ = iface.pending_count_changed(emitter).await;
-    let _ = iface.pending_request_ids_changed(emitter).await;
-    let _ = iface.pending_prompts_changed(emitter).await;
-    let _ = iface.pending_options_list_changed(emitter).await;
+    if let Err(err) = iface.emit_pending_changed(emitter).await {
+        warn!(%err, %session_id, "failed to emit pending request cleanup properties");
+    }
 
     answer
+}
+
+fn elicitation_timeout() -> Duration {
+    std::env::var("AGENT_DBUS_ELICITATION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_ELICITATION_TIMEOUT)
 }
 
 fn clear_pending_if_not_waiting(session: &mut SessionObject) {
@@ -951,18 +718,26 @@ mod tests {
     }
 
     #[test]
-    fn codex_permission_options_offer_native_always_allow_fallback() {
+    fn codex_permission_options_do_not_offer_always_allow_without_prefix_rule() {
         let data = json!({
             "hook_event_name": "PermissionRequest",
             "permission_mode": "default",
             "transcript_path": "/tmp/codex-session.jsonl"
         });
 
+        assert_eq!(build_permission_options(&data), vec!["Allow", "Deny"]);
+
+        let response: serde_json::Value =
+            serde_json::from_str(&permission_response(&data, "Always allow").unwrap()).unwrap();
         assert_eq!(
-            build_permission_options(&data),
-            vec!["Allow", "Always allow", "Deny"]
+            response["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
         );
-        assert_eq!(permission_response(&data, "Always allow"), None);
+        assert!(
+            response["hookSpecificOutput"]["decision"]
+                .get("execPolicyAmendment")
+                .is_none()
+        );
     }
 
     #[test]

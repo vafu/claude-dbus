@@ -7,6 +7,8 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::connection;
 
+use agent_dbus::constants::{BUS_NAME, ROOT_PATH, socket_path};
+
 mod dbus;
 mod hooks;
 mod types;
@@ -24,24 +26,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting agent D-Bus service...");
 
     let conn = connection::Builder::session()?
-        .name("io.github.AgentDBus")?
-        .serve_at("/io/github/AgentDBus", zbus::fdo::ObjectManager)?
+        .name(BUS_NAME)?
+        .serve_at(ROOT_PATH, zbus::fdo::ObjectManager)?
         .build()
         .await?;
 
     info!(unique_name = ?conn.unique_name(), "D-Bus connection established");
 
-    let socket_path = std::env::var("XDG_RUNTIME_DIR")
-        .map(|d| format!("{}/agent-dbus.sock", d))
-        .unwrap_or_else(|_| "/tmp/agent-dbus.sock".to_string());
+    let socket_path = socket_path();
 
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
-    info!(path = %socket_path, "Unix socket listening");
+    info!(path = %socket_path.display(), "Unix socket listening");
 
     let ended: EndedSessions = Arc::new(Mutex::new(HashSet::new()));
     let codex_session_parents: CodexSessionParents = Arc::new(Mutex::new(HashMap::new()));
     hooks::start_codex_compact_watcher(conn.clone());
+    hooks::start_codex_parent_watcher(
+        conn.clone(),
+        Arc::clone(&ended),
+        Arc::clone(&codex_session_parents),
+    );
 
     loop {
         match listener.accept().await {

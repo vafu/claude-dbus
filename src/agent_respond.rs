@@ -1,4 +1,5 @@
-use zbus::zvariant::ObjectPath;
+use agent_dbus::constants::{BUS_NAME, SESSION_INTERFACE};
+use agent_dbus::path::session_path;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,18 +28,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conn = zbus::Connection::session().await?;
     if request_id.is_empty() {
         conn.call_method(
-            Some("io.github.AgentDBus"),
+            Some(BUS_NAME),
             path,
-            Some("io.github.AgentDBus1.Session"),
+            Some(SESSION_INTERFACE),
             "RespondToElicitation",
             &(answer.as_str()),
         )
         .await?;
     } else {
         conn.call_method(
-            Some("io.github.AgentDBus"),
+            Some(BUS_NAME),
             path,
-            Some("io.github.AgentDBus1.Session"),
+            Some(SESSION_INTERFACE),
             "RespondToElicitationById",
             &(request_id.as_str(), answer.as_str()),
         )
@@ -46,32 +47,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn session_path(agent_name: &str, session_id: &str) -> ObjectPath<'static> {
-    let safe_agent = safe_path_segment(agent_name);
-    let safe_id = safe_path_segment(session_id);
-    ObjectPath::try_from(format!(
-        "/io/github/AgentDBus/sessions/{}/{}",
-        safe_agent, safe_id
-    ))
-    .unwrap()
-}
-
-fn safe_path_segment(value: &str) -> String {
-    let safe: String = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if safe.is_empty() {
-        "unknown".to_string()
-    } else {
-        safe
-    }
 }
