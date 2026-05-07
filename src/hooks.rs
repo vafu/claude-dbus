@@ -22,8 +22,8 @@ mod permission;
 use metrics::codex_context_pct;
 use metrics::{apply_usage_limits, context_pct};
 use permission::{
-    build_elicitation_options, build_permission_option_descriptions, build_permission_options,
-    build_permission_prompt, permission_response,
+    build_elicitation_options, build_permission_detail, build_permission_option_descriptions,
+    build_permission_options, build_permission_prompt, permission_response,
 };
 
 static NEXT_PENDING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -426,11 +426,14 @@ pub async fn handle_hook_connection(
             );
             let options = build_permission_options(data);
             let option_descriptions = build_permission_option_descriptions(data, &options);
+            let detail = build_permission_detail(data);
             let response = handle_elicitation_event(
                 &conn,
                 &agent_name,
                 &session_id,
                 build_permission_prompt(data),
+                detail.kind,
+                detail.text,
                 options,
                 option_descriptions,
             )
@@ -457,6 +460,8 @@ pub async fn handle_hook_connection(
                 &agent_name,
                 &session_id,
                 prompt,
+                String::new(),
+                String::new(),
                 options,
                 option_descriptions,
             )
@@ -566,6 +571,8 @@ async fn handle_elicitation_event(
     agent_name: &str,
     session_id: &str,
     prompt: String,
+    detail_kind: String,
+    detail_text: String,
     options: Vec<String>,
     option_descriptions: Vec<String>,
 ) -> String {
@@ -596,6 +603,8 @@ async fn handle_elicitation_event(
         iface.push_pending_request(PendingRequest {
             id: request_id.clone(),
             prompt: prompt.clone(),
+            detail_kind,
+            detail_text,
             options: options.clone(),
             option_descriptions: option_descriptions.clone(),
             tx,
@@ -813,6 +822,55 @@ mod tests {
                 "Deny this request."
             ]
         );
+    }
+
+    #[test]
+    fn codex_apply_patch_permission_detail_preserves_patch() {
+        let patch =
+            "*** Begin Patch\n*** Update File: example.txt\n@@\n-old\n+new\n*** End Patch\n";
+        let data = json!({
+            "tool_name": "apply_patch",
+            "tool_input": { "command": patch }
+        });
+
+        let detail = build_permission_detail(&data);
+
+        assert_eq!(detail.kind, "diff");
+        assert_eq!(detail.text, patch);
+    }
+
+    #[test]
+    fn claude_edit_permission_detail_builds_diff() {
+        let data = json!({
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/tmp/example.txt",
+                "old_string": "old line\nsame",
+                "new_string": "new line\nsame"
+            }
+        });
+
+        let detail = build_permission_detail(&data);
+
+        assert_eq!(detail.kind, "diff");
+        assert_eq!(
+            detail.text,
+            "--- /tmp/example.txt\n+++ /tmp/example.txt\n@@\n-old line\n-same\n+new line\n+same\n"
+        );
+    }
+
+    #[test]
+    fn shell_permission_detail_preserves_full_command() {
+        let command = "printf 'line 1'\nprintf 'line 2'\nprintf 'line 3'";
+        let data = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": command }
+        });
+
+        let detail = build_permission_detail(&data);
+
+        assert_eq!(detail.kind, "command");
+        assert_eq!(detail.text, command);
     }
 
     #[test]

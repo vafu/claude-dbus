@@ -9,6 +9,8 @@ use agent_dbus::path::session_path;
 pub struct PendingRequest {
     pub id: String,
     pub prompt: String,
+    pub detail_kind: String,
+    pub detail_text: String,
     pub options: Vec<String>,
     pub option_descriptions: Vec<String>,
     pub tx: tokio::sync::oneshot::Sender<String>,
@@ -45,10 +47,14 @@ struct SessionSnapshot {
     seven_day_usage_pct: f64,
     seven_day_resets_at: u64,
     pending_prompt: String,
+    pending_detail_kind: String,
+    pending_detail_text: String,
     pending_options: Vec<String>,
     pending_count: usize,
     pending_request_ids: Vec<String>,
     pending_prompts: Vec<String>,
+    pending_detail_kinds: Vec<String>,
+    pending_detail_texts: Vec<String>,
     pending_options_list: Vec<Vec<String>>,
     pending_option_descriptions: Vec<String>,
     pending_option_descriptions_list: Vec<Vec<String>>,
@@ -96,6 +102,20 @@ impl SessionObject {
             .unwrap_or_default()
     }
 
+    pub fn pending_detail_kind_value(&self) -> &str {
+        self.pending_requests
+            .front()
+            .map(|request| request.detail_kind.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn pending_detail_text_value(&self) -> &str {
+        self.pending_requests
+            .front()
+            .map(|request| request.detail_text.as_str())
+            .unwrap_or("")
+    }
+
     pub fn pending_option_descriptions_value(&self) -> Vec<&str> {
         self.pending_requests
             .front()
@@ -120,6 +140,20 @@ impl SessionObject {
         self.pending_requests
             .iter()
             .map(|request| request.prompt.as_str())
+            .collect()
+    }
+
+    pub fn pending_detail_kinds_value(&self) -> Vec<&str> {
+        self.pending_requests
+            .iter()
+            .map(|request| request.detail_kind.as_str())
+            .collect()
+    }
+
+    pub fn pending_detail_texts_value(&self) -> Vec<&str> {
+        self.pending_requests
+            .iter()
+            .map(|request| request.detail_text.as_str())
             .collect()
     }
 
@@ -158,6 +192,8 @@ impl SessionObject {
             seven_day_usage_pct: self.seven_day_usage_pct,
             seven_day_resets_at: self.seven_day_resets_at,
             pending_prompt: self.pending_prompt_value().to_string(),
+            pending_detail_kind: self.pending_detail_kind_value().to_string(),
+            pending_detail_text: self.pending_detail_text_value().to_string(),
             pending_options: self
                 .pending_options_value()
                 .into_iter()
@@ -171,6 +207,16 @@ impl SessionObject {
                 .collect(),
             pending_prompts: self
                 .pending_prompts_value()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            pending_detail_kinds: self
+                .pending_detail_kinds_value()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            pending_detail_texts: self
+                .pending_detail_texts_value()
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
@@ -241,10 +287,14 @@ impl SessionObject {
     pub async fn emit_pending_changed(&self, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
         self.requires_attention_changed(emitter).await?;
         self.pending_prompt_changed(emitter).await?;
+        self.pending_detail_kind_changed(emitter).await?;
+        self.pending_detail_text_changed(emitter).await?;
         self.pending_options_changed(emitter).await?;
         self.pending_count_changed(emitter).await?;
         self.pending_request_ids_changed(emitter).await?;
         self.pending_prompts_changed(emitter).await?;
+        self.pending_detail_kinds_changed(emitter).await?;
+        self.pending_detail_texts_changed(emitter).await?;
         self.pending_options_list_changed(emitter).await?;
         self.pending_option_descriptions_changed(emitter).await?;
         self.pending_option_descriptions_list_changed(emitter)
@@ -264,6 +314,8 @@ mod tests {
             PendingRequest {
                 id: id.to_string(),
                 prompt: format!("prompt {id}"),
+                detail_kind: "text".to_string(),
+                detail_text: format!("detail {id}"),
                 options: vec!["Allow".to_string(), "Deny".to_string()],
                 option_descriptions: vec![
                     "Allow this request".to_string(),
@@ -303,6 +355,23 @@ mod tests {
         assert!(tx.is_some());
         assert_eq!(session.pending_request_ids_value(), vec!["req-1"]);
         assert!(session.requires_attention);
+    }
+
+    #[test]
+    fn pending_detail_values_track_oldest_and_all_requests() {
+        let mut session = SessionObject::new("codex");
+        let (first, _first_rx) = pending_request("req-1");
+        let (second, _second_rx) = pending_request("req-2");
+        session.push_pending_request(first);
+        session.push_pending_request(second);
+
+        assert_eq!(session.pending_detail_kind_value(), "text");
+        assert_eq!(session.pending_detail_text_value(), "detail req-1");
+        assert_eq!(session.pending_detail_kinds_value(), vec!["text", "text"]);
+        assert_eq!(
+            session.pending_detail_texts_value(),
+            vec!["detail req-1", "detail req-2"]
+        );
     }
 
     #[tokio::test]
@@ -364,6 +433,12 @@ async fn emit_changed_properties(
     if before.pending_prompt != after.pending_prompt {
         iface.pending_prompt_changed(emitter).await?;
     }
+    if before.pending_detail_kind != after.pending_detail_kind {
+        iface.pending_detail_kind_changed(emitter).await?;
+    }
+    if before.pending_detail_text != after.pending_detail_text {
+        iface.pending_detail_text_changed(emitter).await?;
+    }
     if before.pending_options != after.pending_options {
         iface.pending_options_changed(emitter).await?;
     }
@@ -375,6 +450,12 @@ async fn emit_changed_properties(
     }
     if before.pending_prompts != after.pending_prompts {
         iface.pending_prompts_changed(emitter).await?;
+    }
+    if before.pending_detail_kinds != after.pending_detail_kinds {
+        iface.pending_detail_kinds_changed(emitter).await?;
+    }
+    if before.pending_detail_texts != after.pending_detail_texts {
+        iface.pending_detail_texts_changed(emitter).await?;
     }
     if before.pending_options_list != after.pending_options_list {
         iface.pending_options_list_changed(emitter).await?;
@@ -458,6 +539,16 @@ impl SessionObject {
     }
 
     #[zbus(property)]
+    fn pending_detail_kind(&self) -> &str {
+        self.pending_detail_kind_value()
+    }
+
+    #[zbus(property)]
+    fn pending_detail_text(&self) -> &str {
+        self.pending_detail_text_value()
+    }
+
+    #[zbus(property)]
     fn pending_options(&self) -> Vec<&str> {
         self.pending_options_value()
     }
@@ -475,6 +566,16 @@ impl SessionObject {
     #[zbus(property)]
     fn pending_prompts(&self) -> Vec<&str> {
         self.pending_prompts_value()
+    }
+
+    #[zbus(property)]
+    fn pending_detail_kinds(&self) -> Vec<&str> {
+        self.pending_detail_kinds_value()
+    }
+
+    #[zbus(property)]
+    fn pending_detail_texts(&self) -> Vec<&str> {
+        self.pending_detail_texts_value()
     }
 
     #[zbus(property)]

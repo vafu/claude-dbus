@@ -125,8 +125,14 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
     let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
     if !window_id.is_empty() {
         let app_instance = format!("app-instance:{key}");
-        update_locus_agent_session_link(&locus, &key, &app_instance, Some((agent, &window_id)), remove)
-            .await;
+        update_locus_agent_session_link(
+            &locus,
+            &key,
+            &app_instance,
+            Some((agent, &window_id)),
+            remove,
+        )
+        .await;
     }
 }
 
@@ -151,7 +157,9 @@ async fn update_locus_agent_session_link(
     } else {
         if let Some((agent, window_id)) = fallback_window {
             let window = format!("window:{window_id}");
-            let _ = locus.set_property(app_instance, "kind", "app-instance").await;
+            let _ = locus
+                .set_property(app_instance, "kind", "app-instance")
+                .await;
             let _ = locus.set_property(app_instance, "name", agent).await;
             let _ = locus
                 .set_property(app_instance, "icon", &safe_path_segment(agent))
