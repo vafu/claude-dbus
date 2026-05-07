@@ -109,7 +109,7 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
     let Ok(connection) = zbus::Connection::session().await else {
         return;
     };
-    let Ok(locus) = locus::Client::new(&connection).await else {
+    let Ok(locus) = locus::GraphWriteProxy::new(&connection).await else {
         return;
     };
 
@@ -118,7 +118,8 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
 
     let app_instance = std::env::var("LOCUS_APP_INSTANCE").unwrap_or_default();
     if !app_instance.is_empty() {
-        update_locus_agent_session_link(&locus, &key, &app_instance, None, remove).await;
+        update_locus_agent_session_link(&locus, &key, session_id, &app_instance, None, remove)
+            .await;
         return;
     }
 
@@ -128,6 +129,7 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
         update_locus_agent_session_link(
             &locus,
             &key,
+            session_id,
             &app_instance,
             Some((agent, &window_id)),
             remove,
@@ -137,8 +139,9 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
 }
 
 async fn update_locus_agent_session_link(
-    locus: &locus::Client<'_>,
+    locus: &locus::GraphWriteProxy<'_>,
     key: &str,
+    session_id: &str,
     app_instance: &str,
     fallback_window: Option<(&str, &str)>,
     remove: bool,
@@ -167,6 +170,7 @@ async fn update_locus_agent_session_link(
             let _ = locus.set_link(&window, "app-instance", app_instance).await;
         }
         let _ = locus.set_property(&target, "kind", "agent-session").await;
+        let _ = locus.set_property(&target, "id", session_id).await;
         let _ = locus.set_link(app_instance, "agent-session", &target).await;
     }
 }
