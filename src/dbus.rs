@@ -1,10 +1,12 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use tracing::{debug, warn};
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::SessionState;
 use agent_dbus::path::session_path;
+
+const MAX_PENDING_REQUESTS_PER_SESSION: usize = 4;
 
 pub struct PendingRequest {
     pub id: String,
@@ -30,6 +32,7 @@ pub struct SessionObject {
     pub seven_day_usage_pct: f64,
     pub seven_day_resets_at: u64,
     pub pending_requests: VecDeque<PendingRequest>,
+    attention_reasons: BTreeSet<String>,
 }
 
 #[derive(PartialEq)]
@@ -38,6 +41,7 @@ struct SessionSnapshot {
     state: SessionState,
     task_complete: bool,
     requires_attention: bool,
+    attention_reasons: Vec<String>,
     context_pct: f64,
     model_name: String,
     cwd: String,
@@ -76,6 +80,7 @@ impl Default for SessionObject {
             seven_day_usage_pct: 0.0,
             seven_day_resets_at: 0,
             pending_requests: VecDeque::new(),
+            attention_reasons: BTreeSet::new(),
         }
     }
 }
@@ -177,12 +182,26 @@ impl SessionObject {
             .collect()
     }
 
+    pub fn attention_reasons_value(&self) -> Vec<&str> {
+        let mut reasons = Vec::new();
+        if !self.pending_requests.is_empty() {
+            reasons.push("pending-request");
+        }
+        reasons.extend(self.attention_reasons.iter().map(String::as_str));
+        reasons
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             agent_name: self.agent_name.clone(),
             state: self.state.clone(),
             task_complete: self.task_complete,
             requires_attention: self.requires_attention,
+            attention_reasons: self
+                .attention_reasons_value()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             context_pct: self.context_pct,
             model_name: self.model_name.clone(),
             cwd: self.cwd.clone(),
@@ -252,13 +271,17 @@ impl SessionObject {
             }
             None => self.pending_requests.pop_front()?,
         };
-        self.requires_attention = !self.pending_requests.is_empty();
+        self.refresh_requires_attention();
         Some(request.tx)
     }
 
-    pub fn push_pending_request(&mut self, request: PendingRequest) {
+    pub fn push_pending_request(&mut self, request: PendingRequest) -> bool {
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS_PER_SESSION {
+            return false;
+        }
         self.pending_requests.push_back(request);
-        self.requires_attention = true;
+        self.refresh_requires_attention();
+        true
     }
 
     pub fn remove_pending_request(&mut self, request_id: &str) -> bool {
@@ -270,13 +293,14 @@ impl SessionObject {
             return false;
         };
         self.pending_requests.remove(index);
-        self.requires_attention = !self.pending_requests.is_empty();
+        self.refresh_requires_attention();
         true
     }
 
     pub fn cancel_pending_requests(&mut self) -> usize {
         let requests = std::mem::take(&mut self.pending_requests);
-        self.requires_attention = false;
+        self.attention_reasons.clear();
+        self.refresh_requires_attention();
         let count = requests.len();
         for request in requests {
             let _ = request.tx.send(String::new());
@@ -284,8 +308,32 @@ impl SessionObject {
         count
     }
 
+    pub fn set_attention_reason(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if !reason.is_empty() {
+            self.attention_reasons.insert(reason);
+        }
+        self.refresh_requires_attention();
+    }
+
+    pub fn clear_attention_reason(&mut self, reason: &str) {
+        self.attention_reasons.remove(reason);
+        self.refresh_requires_attention();
+    }
+
+    pub fn clear_attention_reasons(&mut self) {
+        self.attention_reasons.clear();
+        self.refresh_requires_attention();
+    }
+
+    pub fn refresh_requires_attention(&mut self) {
+        self.requires_attention =
+            !self.pending_requests.is_empty() || !self.attention_reasons.is_empty();
+    }
+
     pub async fn emit_pending_changed(&self, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
         self.requires_attention_changed(emitter).await?;
+        self.attention_reasons_changed(emitter).await?;
         self.pending_prompt_changed(emitter).await?;
         self.pending_detail_kind_changed(emitter).await?;
         self.pending_detail_text_changed(emitter).await?;
@@ -386,6 +434,20 @@ mod tests {
         assert!(session.pending_requests.is_empty());
         assert!(!session.requires_attention);
     }
+
+    #[test]
+    fn attention_reasons_include_pending_requests_and_nonblocking_reasons() {
+        let mut session = SessionObject::new("codex");
+        let (request, _rx) = pending_request("req-1");
+
+        session.push_pending_request(request);
+        session.set_attention_reason("plan-mode-prompt");
+
+        assert_eq!(
+            session.attention_reasons_value(),
+            vec!["pending-request", "plan-mode-prompt"]
+        );
+    }
 }
 
 async fn emit_changed_properties(
@@ -405,6 +467,9 @@ async fn emit_changed_properties(
     }
     if before.requires_attention != after.requires_attention {
         iface.requires_attention_changed(emitter).await?;
+    }
+    if before.attention_reasons != after.attention_reasons {
+        iface.attention_reasons_changed(emitter).await?;
     }
     if before.context_pct != after.context_pct {
         iface.context_pct_changed(emitter).await?;
@@ -491,6 +556,11 @@ impl SessionObject {
     #[zbus(property)]
     fn requires_attention(&self) -> bool {
         self.requires_attention
+    }
+
+    #[zbus(property)]
+    fn attention_reasons(&self) -> Vec<&str> {
+        self.attention_reasons_value()
     }
 
     #[zbus(property)]
@@ -598,12 +668,12 @@ impl SessionObject {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         answer: &str,
     ) {
-        if !answer.is_empty() {
-            if let Some(tx) = self.take_pending_response(None) {
-                let _ = tx.send(answer.to_string());
-                if let Err(err) = self.emit_pending_changed(&emitter).await {
-                    warn!(%err, "failed to emit pending response properties");
-                }
+        if !answer.is_empty()
+            && let Some(tx) = self.take_pending_response(None)
+        {
+            let _ = tx.send(answer.to_string());
+            if let Err(err) = self.emit_pending_changed(&emitter).await {
+                warn!(%err, "failed to emit pending response properties");
             }
         }
     }
@@ -614,12 +684,13 @@ impl SessionObject {
         request_id: &str,
         answer: &str,
     ) {
-        if !request_id.is_empty() && !answer.is_empty() {
-            if let Some(tx) = self.take_pending_response(Some(request_id)) {
-                let _ = tx.send(answer.to_string());
-                if let Err(err) = self.emit_pending_changed(&emitter).await {
-                    warn!(%err, "failed to emit pending response properties");
-                }
+        if !request_id.is_empty()
+            && !answer.is_empty()
+            && let Some(tx) = self.take_pending_response(Some(request_id))
+        {
+            let _ = tx.send(answer.to_string());
+            if let Err(err) = self.emit_pending_changed(&emitter).await {
+                warn!(%err, "failed to emit pending response properties");
             }
         }
     }

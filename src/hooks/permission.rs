@@ -382,8 +382,8 @@ fn is_always_allow_answer(answer: &str) -> bool {
     normalized == "always allow" || normalized.starts_with("always allow ")
 }
 
-fn permission_suggestion_for_answer<'a>(
-    data: &'a serde_json::Value,
+fn permission_suggestion_for_answer(
+    data: &serde_json::Value,
     answer: &str,
 ) -> Option<serde_json::Value> {
     let suggestions = data["permission_suggestions"].as_array()?;

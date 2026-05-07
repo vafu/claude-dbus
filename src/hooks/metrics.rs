@@ -1,10 +1,59 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
 use crate::dbus::SessionObject;
 
-static CODEX_SESSION_FILE_CACHE: OnceLock<StdMutex<HashMap<String, PathBuf>>> = OnceLock::new();
+const CODEX_METRICS_CACHE_MAX: usize = 256;
+const CODEX_SESSION_FILE_CACHE_MAX: usize = 256;
+const CODEX_METRICS_TAIL_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+static CODEX_METRICS_CACHE: OnceLock<StdMutex<BoundedCache<SessionMetrics>>> = OnceLock::new();
+static CODEX_SESSION_FILE_CACHE: OnceLock<StdMutex<BoundedCache<PathBuf>>> = OnceLock::new();
+static CODEX_METRICS_REFRESHES: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+struct BoundedCache<T> {
+    entries: HashMap<String, T>,
+    order: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl<T: Clone> BoundedCache<T> {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<T> {
+        let value = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, value: T) {
+        self.entries.insert(key.clone(), value);
+        self.touch(&key);
+        while self.entries.len() > self.max_entries {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
+        self.order.retain(|entry| entry != key);
+    }
+
+    fn touch(&mut self, key: &str) {
+        self.order.retain(|entry| entry != key);
+        self.order.push_back(key.to_string());
+    }
+}
 
 pub(super) fn apply_usage_limits(
     session: &mut SessionObject,
@@ -13,7 +62,7 @@ pub(super) fn apply_usage_limits(
     data: &serde_json::Value,
 ) {
     let fallback = if agent_name == "codex" {
-        codex_session_metrics(session_id)
+        cached_codex_session_metrics(session_id)
     } else {
         None
     };
@@ -84,9 +133,63 @@ struct SessionMetrics {
     seven_day: Option<(f64, u64)>,
 }
 
-fn codex_session_metrics(session_id: &str) -> Option<SessionMetrics> {
+fn cached_codex_session_metrics(session_id: &str) -> Option<SessionMetrics> {
+    let cached = CODEX_METRICS_CACHE
+        .get_or_init(|| StdMutex::new(BoundedCache::new(CODEX_METRICS_CACHE_MAX)));
+    if let Ok(mut cache) = cached.lock()
+        && let Some(metrics) = cache.get(session_id)
+    {
+        return Some(metrics);
+    }
+
+    schedule_codex_metrics_refresh(session_id);
+    None
+}
+
+fn schedule_codex_metrics_refresh(session_id: &str) {
+    let refreshes = CODEX_METRICS_REFRESHES.get_or_init(|| StdMutex::new(HashSet::new()));
+    if let Ok(mut refreshes) = refreshes.lock() {
+        if refreshes.contains(session_id) {
+            return;
+        }
+        refreshes.insert(session_id.to_string());
+    } else {
+        return;
+    }
+
+    let session_id = session_id.to_string();
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        finish_codex_metrics_refresh(&session_id, None);
+        return;
+    };
+    handle.spawn(async move {
+        let task_session_id = session_id.clone();
+        let metrics =
+            tokio::task::spawn_blocking(move || codex_session_metrics_blocking(&task_session_id))
+                .await
+                .ok()
+                .flatten();
+        finish_codex_metrics_refresh(&session_id, metrics);
+    });
+}
+
+fn finish_codex_metrics_refresh(session_id: &str, metrics: Option<SessionMetrics>) {
+    if let Some(metrics) = metrics {
+        let cache = CODEX_METRICS_CACHE
+            .get_or_init(|| StdMutex::new(BoundedCache::new(CODEX_METRICS_CACHE_MAX)));
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(session_id.to_string(), metrics);
+        }
+    }
+    let refreshes = CODEX_METRICS_REFRESHES.get_or_init(|| StdMutex::new(HashSet::new()));
+    if let Ok(mut refreshes) = refreshes.lock() {
+        refreshes.remove(session_id);
+    }
+}
+
+fn codex_session_metrics_blocking(session_id: &str) -> Option<SessionMetrics> {
     let path = codex_session_file(session_id)?;
-    let contents = std::fs::read_to_string(path).ok()?;
+    let contents = read_session_tail(&path)?;
 
     contents.lines().rev().find_map(|line| {
         let entry: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -104,6 +207,22 @@ fn codex_session_metrics(session_id: &str) -> Option<SessionMetrics> {
     })
 }
 
+fn read_session_tail(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(CODEX_METRICS_TAIL_READ_MAX_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    if start == 0 {
+        return Some(contents);
+    }
+
+    let line_start = contents.find('\n').map(|index| index + 1)?;
+    Some(contents[line_start..].to_string())
+}
+
 pub(super) fn codex_context_pct(token_count_payload: &serde_json::Value) -> Option<f64> {
     context_pct(token_count_payload).or_else(|| {
         let window = token_count_payload["info"]["model_context_window"].as_f64()?;
@@ -119,14 +238,15 @@ pub(super) fn codex_context_pct(token_count_payload: &serde_json::Value) -> Opti
 }
 
 fn codex_session_file(session_id: &str) -> Option<PathBuf> {
-    let cache = CODEX_SESSION_FILE_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
-    if let Ok(mut cache) = cache.lock() {
-        if let Some(path) = cache.get(session_id) {
-            if path.exists() {
-                return Some(path.clone());
-            }
-            cache.remove(session_id);
+    let cache = CODEX_SESSION_FILE_CACHE
+        .get_or_init(|| StdMutex::new(BoundedCache::new(CODEX_SESSION_FILE_CACHE_MAX)));
+    if let Ok(mut cache) = cache.lock()
+        && let Some(path) = cache.get(session_id)
+    {
+        if path.exists() {
+            return Some(path);
         }
+        cache.remove(session_id);
     }
 
     let home = std::env::var_os("HOME")?;

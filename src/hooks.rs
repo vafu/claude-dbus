@@ -41,6 +41,14 @@ struct HookMessage {
     parent_pid: Option<u64>,
 }
 
+struct ElicitationRequest {
+    prompt: String,
+    detail_kind: String,
+    detail_text: String,
+    options: Vec<String>,
+    option_descriptions: Vec<String>,
+}
+
 pub fn start_codex_compact_watcher(conn: zbus::Connection) {
     let Some(path) = codex_log_file() else {
         return;
@@ -373,7 +381,7 @@ pub async fn handle_hook_connection(
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::Thinking;
-                    clear_pending_if_not_waiting(d);
+                    clear_transient_attention(d);
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -431,11 +439,13 @@ pub async fn handle_hook_connection(
                 &conn,
                 &agent_name,
                 &session_id,
-                build_permission_prompt(data),
-                detail.kind,
-                detail.text,
-                options,
-                option_descriptions,
+                ElicitationRequest {
+                    prompt: build_permission_prompt(data),
+                    detail_kind: detail.kind,
+                    detail_text: detail.text,
+                    options,
+                    option_descriptions,
+                },
             )
             .await;
             if let Some(decision) = permission_response(data, &response) {
@@ -459,11 +469,13 @@ pub async fn handle_hook_connection(
                 &conn,
                 &agent_name,
                 &session_id,
-                prompt,
-                String::new(),
-                String::new(),
-                options,
-                option_descriptions,
+                ElicitationRequest {
+                    prompt,
+                    detail_kind: String::new(),
+                    detail_text: String::new(),
+                    options,
+                    option_descriptions,
+                },
             )
             .await;
             if let Err(err) = stream.write_all(response.as_bytes()).await {
@@ -474,7 +486,15 @@ pub async fn handle_hook_connection(
         "RequestUserInput" => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
-                    apply_request_user_input_attention(d, &agent_name, &session_id, data);
+                    apply_nonblocking_attention(
+                        d,
+                        &agent_name,
+                        &session_id,
+                        data,
+                        "request-user-input",
+                        SessionState::Thinking,
+                        false,
+                    );
                 })
                 .await,
                 "update_session",
@@ -485,7 +505,197 @@ pub async fn handle_hook_connection(
         "RequestUserInputResolved" => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
-                    clear_request_user_input_attention(d);
+                    d.clear_attention_reason("request-user-input");
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "PlanModePrompt" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_nonblocking_attention(
+                        d,
+                        &agent_name,
+                        &session_id,
+                        data,
+                        "plan-mode-prompt",
+                        SessionState::Idle,
+                        true,
+                    );
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "PlanModePromptResolved" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.clear_attention_reason("plan-mode-prompt");
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "AgentTurnCompleteAttention" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_nonblocking_attention(
+                        d,
+                        &agent_name,
+                        &session_id,
+                        data,
+                        "agent-turn-complete",
+                        SessionState::Idle,
+                        true,
+                    );
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "AgentTurnCompleteAttentionResolved" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.clear_attention_reason("agent-turn-complete");
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "ToolSuggestion" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_nonblocking_attention(
+                        d,
+                        &agent_name,
+                        &session_id,
+                        data,
+                        "tool-suggestion",
+                        SessionState::Idle,
+                        false,
+                    );
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "ToolSuggestionResolved" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.clear_attention_reason("tool-suggestion");
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "ExecApprovalRequest" => {
+            apply_attention_event(
+                &conn,
+                &agent_name,
+                &session_id,
+                data,
+                "exec-approval",
+                SessionState::Thinking,
+                false,
+            )
+            .await;
+        }
+
+        "ExecApprovalResolved" => {
+            clear_attention_event(&conn, &agent_name, &session_id, "exec-approval").await;
+        }
+
+        "ApplyPatchApprovalRequest" => {
+            apply_attention_event(
+                &conn,
+                &agent_name,
+                &session_id,
+                data,
+                "apply-patch-approval",
+                SessionState::Thinking,
+                false,
+            )
+            .await;
+        }
+
+        "ApplyPatchApprovalResolved" => {
+            clear_attention_event(&conn, &agent_name, &session_id, "apply-patch-approval").await;
+        }
+
+        "RequestPermissions" => {
+            apply_attention_event(
+                &conn,
+                &agent_name,
+                &session_id,
+                data,
+                "request-permissions",
+                SessionState::Thinking,
+                false,
+            )
+            .await;
+        }
+
+        "RequestPermissionsResolved" => {
+            clear_attention_event(&conn, &agent_name, &session_id, "request-permissions").await;
+        }
+
+        "McpServerElicitationRequest" => {
+            apply_attention_event(
+                &conn,
+                &agent_name,
+                &session_id,
+                data,
+                "mcp-server-elicitation",
+                SessionState::Thinking,
+                false,
+            )
+            .await;
+        }
+
+        "McpServerElicitationResolved" => {
+            clear_attention_event(&conn, &agent_name, &session_id, "mcp-server-elicitation").await;
+        }
+
+        "AttentionRequired" => {
+            let reason = attention_reason(data);
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_nonblocking_attention(
+                        d,
+                        &agent_name,
+                        &session_id,
+                        data,
+                        &reason,
+                        attention_state(data).unwrap_or(SessionState::Idle),
+                        data["task_complete"].as_bool().unwrap_or(d.task_complete),
+                    );
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "AttentionResolved" => {
+            let reason = attention_reason(data);
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.clear_attention_reason(&reason);
                 })
                 .await,
                 "update_session",
@@ -558,6 +768,49 @@ fn log_zbus_result(result: zbus::Result<()>, action: &str, session_id: &str) {
     }
 }
 
+async fn apply_attention_event(
+    conn: &zbus::Connection,
+    agent_name: &str,
+    session_id: &str,
+    data: &serde_json::Value,
+    reason: &str,
+    state: SessionState,
+    task_complete: bool,
+) {
+    log_zbus_result(
+        update_session(conn, agent_name, session_id, |d| {
+            apply_nonblocking_attention(
+                d,
+                agent_name,
+                session_id,
+                data,
+                reason,
+                state,
+                task_complete,
+            );
+        })
+        .await,
+        "update_session",
+        session_id,
+    );
+}
+
+async fn clear_attention_event(
+    conn: &zbus::Connection,
+    agent_name: &str,
+    session_id: &str,
+    reason: &str,
+) {
+    log_zbus_result(
+        update_session(conn, agent_name, session_id, |d| {
+            d.clear_attention_reason(reason);
+        })
+        .await,
+        "update_session",
+        session_id,
+    );
+}
+
 fn model_name(data: &serde_json::Value) -> String {
     data["model"]["display_name"]
         .as_str()
@@ -570,14 +823,10 @@ async fn handle_elicitation_event(
     conn: &zbus::Connection,
     agent_name: &str,
     session_id: &str,
-    prompt: String,
-    detail_kind: String,
-    detail_text: String,
-    options: Vec<String>,
-    option_descriptions: Vec<String>,
+    request: ElicitationRequest,
 ) -> String {
     use tokio::sync::oneshot;
-    info!(agent = %agent_name, session_id = %session_id, prompt = %prompt, ?options, "elicitation");
+    info!(agent = %agent_name, session_id = %session_id, prompt = %request.prompt, ?request.options, "elicitation");
 
     let path = session_path(agent_name, session_id);
     if let Err(err) = conn
@@ -600,15 +849,22 @@ async fn handle_elicitation_event(
     let request_id = next_pending_request_id();
     {
         let mut iface = iface_ref.get_mut().await;
-        iface.push_pending_request(PendingRequest {
+        if !iface.push_pending_request(PendingRequest {
             id: request_id.clone(),
-            prompt: prompt.clone(),
-            detail_kind,
-            detail_text,
-            options: options.clone(),
-            option_descriptions: option_descriptions.clone(),
+            prompt: request.prompt.clone(),
+            detail_kind: request.detail_kind,
+            detail_text: request.detail_text,
+            options: request.options.clone(),
+            option_descriptions: request.option_descriptions.clone(),
             tx,
-        });
+        }) {
+            warn!(
+                agent = %agent_name,
+                session_id = %session_id,
+                "pending request limit reached; dropping elicitation"
+            );
+            return String::new();
+        }
     }
 
     let emitter = iface_ref.signal_emitter();
@@ -619,22 +875,30 @@ async fn handle_elicitation_event(
         }
     }
 
-    let option_refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
-    let option_description_refs: Vec<&str> =
-        option_descriptions.iter().map(|s| s.as_str()).collect();
+    let option_refs: Vec<&str> = request.options.iter().map(|s| s.as_str()).collect();
+    let option_description_refs: Vec<&str> = request
+        .option_descriptions
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     log_zbus_result(
-        emit_elicitation(emitter, &prompt, &option_refs).await,
+        emit_elicitation(emitter, &request.prompt, &option_refs).await,
         "emit_elicitation",
         session_id,
     );
     log_zbus_result(
-        emit_elicitation_with_id(emitter, &request_id, &prompt, &option_refs).await,
+        emit_elicitation_with_id(emitter, &request_id, &request.prompt, &option_refs).await,
         "emit_elicitation_with_id",
         session_id,
     );
     log_zbus_result(
-        emit_elicitation_with_details(emitter, &prompt, &option_refs, &option_description_refs)
-            .await,
+        emit_elicitation_with_details(
+            emitter,
+            &request.prompt,
+            &option_refs,
+            &option_description_refs,
+        )
+        .await,
         "emit_elicitation_with_details",
         session_id,
     );
@@ -642,7 +906,7 @@ async fn handle_elicitation_event(
         emit_elicitation_with_id_and_details(
             emitter,
             &request_id,
-            &prompt,
+            &request.prompt,
             &option_refs,
             &option_description_refs,
         )
@@ -686,27 +950,48 @@ fn elicitation_timeout() -> Duration {
 }
 
 fn clear_pending_if_not_waiting(session: &mut SessionObject) {
-    if session.pending_requests.is_empty() {
-        session.requires_attention = false;
-    }
+    session.clear_attention_reasons();
 }
 
-fn apply_request_user_input_attention(
+fn clear_transient_attention(session: &mut SessionObject) {
+    session.clear_attention_reasons();
+}
+
+fn apply_nonblocking_attention(
     session: &mut SessionObject,
     agent_name: &str,
     session_id: &str,
     data: &serde_json::Value,
+    reason: &str,
+    state: SessionState,
+    task_complete: bool,
 ) {
-    session.state = SessionState::Thinking;
-    session.task_complete = false;
-    session.requires_attention = true;
+    session.state = state;
+    session.task_complete = task_complete;
+    session.set_attention_reason(reason);
     session.model_name = model_name(data);
     session.cwd = data["cwd"].as_str().unwrap_or("").to_string();
     apply_usage_limits(session, agent_name, session_id, data);
 }
 
-fn clear_request_user_input_attention(session: &mut SessionObject) {
-    clear_pending_if_not_waiting(session);
+fn attention_reason(data: &serde_json::Value) -> String {
+    data["reason"]
+        .as_str()
+        .or_else(|| data["kind"].as_str())
+        .or_else(|| data["attention_kind"].as_str())
+        .unwrap_or("attention")
+        .to_string()
+}
+
+fn attention_state(data: &serde_json::Value) -> Option<SessionState> {
+    match data["state"].as_str()? {
+        "no-session" => Some(SessionState::NoSession),
+        "idle" => Some(SessionState::Idle),
+        "thinking" => Some(SessionState::Thinking),
+        "tool-use" => Some(SessionState::ToolUse),
+        "compacting" => Some(SessionState::Compacting),
+        _ => None,
+    }
 }
 
 fn next_pending_request_id() -> String {
@@ -1034,7 +1319,15 @@ mod tests {
             "model": "gpt-test"
         });
 
-        apply_request_user_input_attention(&mut session, "codex", "session-1", &data);
+        apply_nonblocking_attention(
+            &mut session,
+            "codex",
+            "session-1",
+            &data,
+            "request-user-input",
+            SessionState::Thinking,
+            false,
+        );
 
         assert!(matches!(session.state, SessionState::Thinking));
         assert!(!session.task_complete);
@@ -1043,8 +1336,67 @@ mod tests {
         assert_eq!(session.cwd, "/tmp/project");
         assert_eq!(session.pending_requests.len(), 0);
 
-        clear_request_user_input_attention(&mut session);
+        session.clear_attention_reason("request-user-input");
 
         assert!(!session.requires_attention);
+    }
+
+    #[test]
+    fn nonblocking_attention_tracks_independent_reasons() {
+        let mut session = SessionObject::new("codex");
+        let data = json!({
+            "session_id": "session-1",
+            "cwd": "/tmp/project",
+            "model": "gpt-test"
+        });
+
+        apply_nonblocking_attention(
+            &mut session,
+            "codex",
+            "session-1",
+            &data,
+            "request-user-input",
+            SessionState::Thinking,
+            false,
+        );
+        apply_nonblocking_attention(
+            &mut session,
+            "codex",
+            "session-1",
+            &data,
+            "plan-mode-prompt",
+            SessionState::Idle,
+            true,
+        );
+
+        session.clear_attention_reason("request-user-input");
+        assert!(session.requires_attention);
+
+        session.clear_attention_reason("plan-mode-prompt");
+        assert!(!session.requires_attention);
+    }
+
+    #[test]
+    fn plan_mode_prompt_attention_marks_turn_complete_idle() {
+        let mut session = SessionObject::new("codex");
+        let data = json!({
+            "session_id": "session-1",
+            "cwd": "/tmp/project",
+            "model": "gpt-test"
+        });
+
+        apply_nonblocking_attention(
+            &mut session,
+            "codex",
+            "session-1",
+            &data,
+            "plan-mode-prompt",
+            SessionState::Idle,
+            true,
+        );
+
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.task_complete);
+        assert!(session.requires_attention);
     }
 }

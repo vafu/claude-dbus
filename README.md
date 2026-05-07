@@ -180,7 +180,8 @@ Use `GetManagedObjects` to list all active sessions.
 | `AgentName` | `s` | Agent backend name, such as `codex` or `claude` |
 | `State` | `s` | `no-session`, `idle`, `thinking`, `tool-use`, `compacting` |
 | `TaskComplete` | `b` | `true` when the current task/turn completes |
-| `RequiresAttention` | `b` | `true` when an approval/input request is waiting |
+| `RequiresAttention` | `b` | `true` when an approval/input request, Plan mode prompt, tool suggestion, or turn-complete attention marker is waiting |
+| `AttentionReasons` | `as` | Active attention reason keys, including `pending-request`, `request-user-input`, `plan-mode-prompt`, `agent-turn-complete`, `tool-suggestion`, and native Codex approval aliases |
 | `ContextPct` | `d` | Context window usage percentage when supplied by input |
 | `ModelName` | `s` | Active model slug or display name |
 | `Cwd` | `s` | Working directory |
@@ -242,4 +243,7 @@ busctl --user call io.github.AgentDBus /io/github/AgentDBus org.freedesktop.DBus
 | Flag | Set by | Cleared by |
 |------|--------|------------|
 | `TaskComplete` | `Stop`, `TaskCompleted` | `SessionStart`, `UserPromptSubmit` |
-| `RequiresAttention` | `PermissionRequest`, `Elicitation`, `RequestUserInput` | `PostToolUse`, user response, `RequestUserInputResolved`, `UserPromptSubmit` |
+| `RequiresAttention` | `PermissionRequest`, `Elicitation`, `RequestUserInput`, `PlanModePrompt`, `AgentTurnCompleteAttention`, `ToolSuggestion`, native Codex approval aliases, `AttentionRequired` | `PostToolUse`, user response, matching `*Resolved` events, `AttentionResolved`, `UserPromptSubmit` |
+
+Non-blocking attention events use internal reason keys so overlapping prompts do not clear each other. `AttentionRequired` and `AttentionResolved` accept `reason`, `kind`, or `attention_kind` in the hook data; if omitted, the reason is `attention`.
+Native Codex approval aliases are `ExecApprovalRequest`, `ApplyPatchApprovalRequest`, `RequestPermissions`, and `McpServerElicitationRequest`, with matching `*Resolved` events.
