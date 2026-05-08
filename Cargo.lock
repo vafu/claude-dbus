@@ -435,6 +435,8 @@ name = "locus-core"
 version = "0.1.0"
 dependencies = [
  "locus-schema",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
