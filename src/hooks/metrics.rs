@@ -1,17 +1,14 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
 use crate::dbus::SessionObject;
 
-const CODEX_METRICS_CACHE_MAX: usize = 256;
 const CODEX_SESSION_FILE_CACHE_MAX: usize = 256;
 const CODEX_METRICS_TAIL_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-static CODEX_METRICS_CACHE: OnceLock<StdMutex<BoundedCache<SessionMetrics>>> = OnceLock::new();
 static CODEX_SESSION_FILE_CACHE: OnceLock<StdMutex<BoundedCache<PathBuf>>> = OnceLock::new();
-static CODEX_METRICS_REFRESHES: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 
 struct BoundedCache<T> {
     entries: HashMap<String, T>,
@@ -62,7 +59,7 @@ pub(super) fn apply_usage_limits(
     data: &serde_json::Value,
 ) {
     let fallback = if agent_name == "codex" {
-        cached_codex_session_metrics(session_id)
+        codex_session_metrics(session_id)
     } else {
         None
     };
@@ -133,61 +130,7 @@ struct SessionMetrics {
     seven_day: Option<(f64, u64)>,
 }
 
-fn cached_codex_session_metrics(session_id: &str) -> Option<SessionMetrics> {
-    let cached = CODEX_METRICS_CACHE
-        .get_or_init(|| StdMutex::new(BoundedCache::new(CODEX_METRICS_CACHE_MAX)));
-    if let Ok(mut cache) = cached.lock()
-        && let Some(metrics) = cache.get(session_id)
-    {
-        return Some(metrics);
-    }
-
-    schedule_codex_metrics_refresh(session_id);
-    None
-}
-
-fn schedule_codex_metrics_refresh(session_id: &str) {
-    let refreshes = CODEX_METRICS_REFRESHES.get_or_init(|| StdMutex::new(HashSet::new()));
-    if let Ok(mut refreshes) = refreshes.lock() {
-        if refreshes.contains(session_id) {
-            return;
-        }
-        refreshes.insert(session_id.to_string());
-    } else {
-        return;
-    }
-
-    let session_id = session_id.to_string();
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        finish_codex_metrics_refresh(&session_id, None);
-        return;
-    };
-    handle.spawn(async move {
-        let task_session_id = session_id.clone();
-        let metrics =
-            tokio::task::spawn_blocking(move || codex_session_metrics_blocking(&task_session_id))
-                .await
-                .ok()
-                .flatten();
-        finish_codex_metrics_refresh(&session_id, metrics);
-    });
-}
-
-fn finish_codex_metrics_refresh(session_id: &str, metrics: Option<SessionMetrics>) {
-    if let Some(metrics) = metrics {
-        let cache = CODEX_METRICS_CACHE
-            .get_or_init(|| StdMutex::new(BoundedCache::new(CODEX_METRICS_CACHE_MAX)));
-        if let Ok(mut cache) = cache.lock() {
-            cache.insert(session_id.to_string(), metrics);
-        }
-    }
-    let refreshes = CODEX_METRICS_REFRESHES.get_or_init(|| StdMutex::new(HashSet::new()));
-    if let Ok(mut refreshes) = refreshes.lock() {
-        refreshes.remove(session_id);
-    }
-}
-
-fn codex_session_metrics_blocking(session_id: &str) -> Option<SessionMetrics> {
+fn codex_session_metrics(session_id: &str) -> Option<SessionMetrics> {
     let path = codex_session_file(session_id)?;
     let contents = read_session_tail(&path)?;
 
