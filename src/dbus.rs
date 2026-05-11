@@ -20,6 +20,10 @@ pub struct PendingRequest {
 
 pub struct SessionObject {
     pub agent_name: String,
+    pub is_subagent: bool,
+    pub parent_session_id: String,
+    pub agent_nickname: String,
+    pub agent_role: String,
     pub state: SessionState,
     pub task_complete: bool,
     pub requires_attention: bool,
@@ -38,6 +42,10 @@ pub struct SessionObject {
 #[derive(PartialEq)]
 struct SessionSnapshot {
     agent_name: String,
+    is_subagent: bool,
+    parent_session_id: String,
+    agent_nickname: String,
+    agent_role: String,
     state: SessionState,
     task_complete: bool,
     requires_attention: bool,
@@ -68,6 +76,10 @@ impl Default for SessionObject {
     fn default() -> Self {
         Self {
             agent_name: String::new(),
+            is_subagent: false,
+            parent_session_id: String::new(),
+            agent_nickname: String::new(),
+            agent_role: String::new(),
             state: SessionState::NoSession,
             task_complete: false,
             requires_attention: false,
@@ -194,6 +206,10 @@ impl SessionObject {
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             agent_name: self.agent_name.clone(),
+            is_subagent: self.is_subagent,
+            parent_session_id: self.parent_session_id.clone(),
+            agent_nickname: self.agent_nickname.clone(),
+            agent_role: self.agent_role.clone(),
             state: self.state.clone(),
             task_complete: self.task_complete,
             requires_attention: self.requires_attention,
@@ -459,6 +475,18 @@ async fn emit_changed_properties(
     if before.agent_name != after.agent_name {
         iface.agent_name_changed(emitter).await?;
     }
+    if before.is_subagent != after.is_subagent {
+        iface.is_subagent_changed(emitter).await?;
+    }
+    if before.parent_session_id != after.parent_session_id {
+        iface.parent_session_id_changed(emitter).await?;
+    }
+    if before.agent_nickname != after.agent_nickname {
+        iface.agent_nickname_changed(emitter).await?;
+    }
+    if before.agent_role != after.agent_role {
+        iface.agent_role_changed(emitter).await?;
+    }
     if before.state != after.state {
         iface.state_changed(emitter).await?;
     }
@@ -541,6 +569,26 @@ impl SessionObject {
     #[zbus(property)]
     fn agent_name(&self) -> &str {
         &self.agent_name
+    }
+
+    #[zbus(property)]
+    fn is_subagent(&self) -> bool {
+        self.is_subagent
+    }
+
+    #[zbus(property)]
+    fn parent_session_id(&self) -> &str {
+        &self.parent_session_id
+    }
+
+    #[zbus(property)]
+    fn agent_nickname(&self) -> &str {
+        &self.agent_nickname
+    }
+
+    #[zbus(property)]
+    fn agent_role(&self) -> &str {
+        &self.agent_role
     }
 
     #[zbus(property)]

@@ -23,7 +23,7 @@ agent-dbus                       (long-running service)
 
 The service stores sessions under both agent name and session id, so `claude` and `codex` sessions can run at the same time without object-path collisions.
 
-Codex does not currently expose a `SessionEnd` command hook. For Codex hook messages, `agent-hook` includes the parent Codex process id and `agent-dbus` removes the session object after that process exits. `Stop` still means turn completion.
+Codex does not currently expose a `SessionEnd` command hook. For Codex hook messages, `agent-hook` includes the parent Codex process id and `agent-dbus` removes top-level session objects after that process exits. `Stop` still means turn completion for top-level sessions. Codex subagent sessions are identified from Codex session metadata and are removed when their own `Stop` hook arrives.
 
 Codex also does not expose a compact lifecycle hook. To surface `compacting` state for Codex sessions, `agent-dbus` watches the local Codex TUI log for `op.dispatch.compact` start/close lines and maps those `thread_id` values back to Codex session objects. All regular lifecycle events, approval/input requests, and session metrics still flow through the Unix socket hook path.
 
@@ -178,6 +178,10 @@ Use `GetManagedObjects` to list all active sessions.
 | Property | Type | Description |
 |----------|------|-------------|
 | `AgentName` | `s` | Agent backend name, such as `codex` or `claude` |
+| `IsSubagent` | `b` | `true` when the session is a spawned subagent |
+| `ParentSessionId` | `s` | Parent session id for subagents |
+| `AgentNickname` | `s` | Codex subagent nickname when supplied |
+| `AgentRole` | `s` | Codex subagent role, such as `explorer` or `worker`, when supplied |
 | `State` | `s` | `no-session`, `idle`, `thinking`, `tool-use`, `compacting` |
 | `TaskComplete` | `b` | `true` when the current task/turn completes |
 | `RequiresAttention` | `b` | `true` when an approval/input request, Plan mode prompt, tool suggestion, or turn-complete attention marker is waiting |

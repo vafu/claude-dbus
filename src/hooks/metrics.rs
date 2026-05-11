@@ -180,7 +180,7 @@ pub(super) fn codex_context_pct(token_count_payload: &serde_json::Value) -> Opti
     })
 }
 
-fn codex_session_file(session_id: &str) -> Option<PathBuf> {
+pub(super) fn codex_session_file(session_id: &str) -> Option<PathBuf> {
     let cache = CODEX_SESSION_FILE_CACHE
         .get_or_init(|| StdMutex::new(BoundedCache::new(CODEX_SESSION_FILE_CACHE_MAX)));
     if let Ok(mut cache) = cache.lock()
