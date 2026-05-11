@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use agent_dbus::constants::socket_path;
 use agent_dbus::path::{agent_session_node_key, safe_path_segment};
+use locus::GraphReadProxy;
+
+const SUBAGENT_SESSION_RELATION: &str = "subagent-session";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,31 +116,72 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
     let Ok(locus) = locus::GraphWriteProxy::new(&connection).await else {
         return;
     };
+    let Ok(locus_read) = GraphReadProxy::new(&connection).await else {
+        return;
+    };
 
     let key = agent_session_node_key(agent, session_id);
-    let remove = event == "SessionEnd";
     let cwd = data["cwd"].as_str();
+    let subagent_parent_session_id = codex_subagent_parent_session_id(agent, session_id, data);
+    let remove = event == "SessionEnd"
+        || (event == "Stop" && subagent_parent_session_id.as_deref().is_some());
 
     let app_instance = std::env::var("LOCUS_APP_INSTANCE").unwrap_or_default();
     if !app_instance.is_empty() {
-        update_locus_agent_session_link(&locus, &key, session_id, &app_instance, None, cwd, remove)
+        if let Some(parent_session_id) = subagent_parent_session_id.as_deref() {
+            update_locus_subagent_session_link(
+                &locus,
+                &locus_read,
+                agent,
+                &key,
+                session_id,
+                parent_session_id,
+                cwd,
+                remove,
+            )
             .await;
+        } else {
+            update_locus_agent_session_link(
+                &locus,
+                &key,
+                session_id,
+                &app_instance,
+                None,
+                cwd,
+                remove,
+            )
+            .await;
+        }
         return;
     }
 
     let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
     if !window_id.is_empty() {
-        let app_instance = format!("app-instance:{key}");
-        update_locus_agent_session_link(
-            &locus,
-            &key,
-            session_id,
-            &app_instance,
-            Some((agent, &window_id)),
-            cwd,
-            remove,
-        )
-        .await;
+        if let Some(parent_session_id) = subagent_parent_session_id.as_deref() {
+            update_locus_subagent_session_link(
+                &locus,
+                &locus_read,
+                agent,
+                &key,
+                session_id,
+                parent_session_id,
+                cwd,
+                remove,
+            )
+            .await;
+        } else {
+            let app_instance = format!("app-instance:{key}");
+            update_locus_agent_session_link(
+                &locus,
+                &key,
+                session_id,
+                &app_instance,
+                Some((agent, &window_id)),
+                cwd,
+                remove,
+            )
+            .await;
+        }
     }
 }
 
@@ -181,6 +225,59 @@ async fn update_locus_agent_session_link(
         }
         let _ = locus.set_link(app_instance, "agent-session", &target).await;
         publish_session_project(locus, &target, cwd).await;
+    }
+}
+
+async fn update_locus_subagent_session_link(
+    locus: &locus::GraphWriteProxy<'_>,
+    locus_read: &GraphReadProxy<'_>,
+    agent: &str,
+    key: &str,
+    session_id: &str,
+    parent_session_id: &str,
+    cwd: Option<&str>,
+    remove: bool,
+) {
+    let target = format!("agent-session:{key}");
+    let parent_key = agent_session_node_key(agent, parent_session_id);
+    let parent = format!("agent-session:{parent_key}");
+
+    if remove {
+        let _ = locus
+            .remove_link(&parent, SUBAGENT_SESSION_RELATION, &target)
+            .await;
+        remove_existing_top_level_session_links(locus, locus_read, &target).await;
+        let _ = locus.remove_links(&target, "session-project").await;
+        return;
+    }
+
+    remove_existing_top_level_session_links(locus, locus_read, &target).await;
+    let _ = locus.set_property(&target, "kind", "agent-session").await;
+    let _ = locus.set_property(&target, "id", session_id).await;
+    if let Some(cwd) = cwd {
+        let _ = locus.set_property(&target, "cwd", cwd).await;
+    }
+    let _ = locus.set_property(&parent, "kind", "agent-session").await;
+    let _ = locus.set_property(&parent, "id", parent_session_id).await;
+    let _ = locus
+        .set_link(&parent, SUBAGENT_SESSION_RELATION, &target)
+        .await;
+    let _ = locus.remove_links(&target, "session-project").await;
+}
+
+async fn remove_existing_top_level_session_links(
+    locus: &locus::GraphWriteProxy<'_>,
+    locus_read: &GraphReadProxy<'_>,
+    target: &str,
+) {
+    for app_instance in locus_read
+        .get_sources(target, "agent-session")
+        .await
+        .unwrap_or_default()
+    {
+        let _ = locus
+            .remove_link(&app_instance, "agent-session", target)
+            .await;
     }
 }
 
@@ -248,4 +345,112 @@ fn read_project_metadata(root: &Path) -> Option<serde_json::Value> {
 
 fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(str::to_string)
+}
+
+fn codex_subagent_parent_session_id(
+    agent: &str,
+    session_id: &str,
+    data: &serde_json::Value,
+) -> Option<String> {
+    if agent != "codex" {
+        return None;
+    }
+
+    if let Some(parent_session_id) = codex_subagent_parent_session_id_from_value(data) {
+        return Some(parent_session_id);
+    }
+
+    codex_session_file(session_id)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|value| {
+                    value
+                        .get("payload")
+                        .and_then(codex_subagent_parent_session_id_from_value)
+                        .or_else(|| codex_subagent_parent_session_id_from_value(&value))
+                })
+        })
+}
+
+fn codex_subagent_parent_session_id_from_value(data: &serde_json::Value) -> Option<String> {
+    let explicit_subagent = data["thread_source"].as_str() == Some("subagent")
+        || data
+            .pointer("/source/subagent/thread_spawn")
+            .is_some_and(|value| !value.is_null())
+        || data
+            .pointer("/payload/source/subagent/thread_spawn")
+            .is_some_and(|value| !value.is_null());
+    let parent_session_id = json_string_at_any(
+        data,
+        &[
+            &["source", "subagent", "thread_spawn", "parent_thread_id"],
+            &[
+                "payload",
+                "source",
+                "subagent",
+                "thread_spawn",
+                "parent_thread_id",
+            ],
+        ],
+    );
+
+    if !explicit_subagent && parent_session_id.is_none() {
+        return None;
+    }
+
+    parent_session_id.filter(|parent| !parent.is_empty())
+}
+
+fn json_string_at_any(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| json_string_at(value, path))
+}
+
+fn json_string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str().map(str::to_string)
+}
+
+fn codex_session_file(session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut matches = Vec::new();
+    collect_matching_codex_sessions(
+        &Path::new(&home).join(".codex/sessions"),
+        session_id,
+        &mut matches,
+    );
+    matches.into_iter().max_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    })
+}
+
+fn collect_matching_codex_sessions(dir: &Path, session_id: &str, matches: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            collect_matching_codex_sessions(&path, session_id, matches);
+        } else if file_type.is_file()
+            && path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+        {
+            matches.push(path);
+        }
+    }
 }

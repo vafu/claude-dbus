@@ -13,19 +13,21 @@ use crate::dbus::{
 };
 use crate::types::SessionState;
 use crate::{CodexSessionParents, EndedSessions};
-use agent_dbus::path::{session_key, session_path};
+use agent_dbus::path::{agent_session_node_key, session_key, session_path};
+use locus::{GraphReadProxy, GraphWriteProxy};
 
 mod metrics;
 mod permission;
 
 #[cfg(test)]
 use metrics::codex_context_pct;
-use metrics::{apply_usage_limits, context_pct};
+use metrics::{apply_usage_limits, codex_session_file, context_pct};
 use permission::{
     build_elicitation_options, build_permission_detail, build_permission_option_descriptions,
     build_permission_options, build_permission_prompt, permission_response,
 };
 
+const SUBAGENT_SESSION_RELATION: &str = "subagent-session";
 static NEXT_PENDING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_HOOK_MESSAGE_BYTES: u64 = 1024 * 1024;
 const HOOK_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,6 +49,13 @@ struct ElicitationRequest {
     detail_text: String,
     options: Vec<String>,
     option_descriptions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SubagentInfo {
+    parent_session_id: String,
+    nickname: String,
+    role: String,
 }
 
 pub fn start_codex_compact_watcher(conn: zbus::Connection) {
@@ -289,6 +298,7 @@ pub async fn handle_hook_connection(
         }
 
         "SessionStart" => {
+            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 create_session(&conn, &agent_name, &session_id).await,
                 "create_session",
@@ -300,6 +310,7 @@ pub async fn handle_hook_connection(
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
+                    apply_subagent_info(d, subagent_info.as_ref());
                     d.task_complete = false;
                     clear_pending_if_not_waiting(d);
                 })
@@ -307,9 +318,56 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
+            if let Some(info) = subagent_info.as_ref() {
+                publish_locus_subagent_session_link(
+                    &agent_name,
+                    &session_id,
+                    info,
+                    data["cwd"].as_str(),
+                    false,
+                )
+                .await;
+            }
         }
 
         "Stop" => {
+            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
+            let parent_session_id = if let Some(info) = subagent_info.as_ref() {
+                Some(info.parent_session_id.clone())
+            } else {
+                subagent_parent_session_id(&conn, &agent_name, &session_id).await
+            };
+            if parent_session_id.is_some() {
+                let fallback_info;
+                let info = if let Some(info) = subagent_info.as_ref() {
+                    info
+                } else {
+                    fallback_info = SubagentInfo {
+                        parent_session_id: parent_session_id.unwrap_or_default(),
+                        nickname: String::new(),
+                        role: String::new(),
+                    };
+                    &fallback_info
+                };
+                publish_locus_subagent_session_link(
+                    &agent_name,
+                    &session_id,
+                    info,
+                    data["cwd"].as_str(),
+                    true,
+                )
+                .await;
+                remove_session(
+                    &conn,
+                    &ended,
+                    &codex_session_parents,
+                    &agent_name,
+                    &session_id,
+                )
+                .await;
+                info!(agent = %agent_name, session_id = %session_id, "removed subagent session after Stop");
+                return;
+            }
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::Idle;
@@ -348,6 +406,7 @@ pub async fn handle_hook_connection(
         }
 
         "UserPromptSubmit" => {
+            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::Thinking;
@@ -356,6 +415,7 @@ pub async fn handle_hook_connection(
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
+                    apply_subagent_info(d, subagent_info.as_ref());
                 })
                 .await,
                 "update_session",
@@ -364,12 +424,14 @@ pub async fn handle_hook_connection(
         }
 
         "PreToolUse" => {
+            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::ToolUse;
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
+                    apply_subagent_info(d, subagent_info.as_ref());
                 })
                 .await,
                 "update_session",
@@ -378,6 +440,7 @@ pub async fn handle_hook_connection(
         }
 
         "PostToolUse" => {
+            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::Thinking;
@@ -385,6 +448,7 @@ pub async fn handle_hook_connection(
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
+                    apply_subagent_info(d, subagent_info.as_ref());
                 })
                 .await,
                 "update_session",
@@ -758,6 +822,87 @@ async fn remove_session(
     }
 }
 
+async fn subagent_parent_session_id(
+    conn: &zbus::Connection,
+    agent_name: &str,
+    session_id: &str,
+) -> Option<String> {
+    let path = session_path(agent_name, session_id);
+    let Ok(iface_ref) = conn
+        .object_server()
+        .interface::<_, SessionObject>(&path)
+        .await
+    else {
+        return None;
+    };
+    let iface = iface_ref.get().await;
+    (iface.is_subagent && !iface.parent_session_id.is_empty())
+        .then(|| iface.parent_session_id.clone())
+}
+
+async fn publish_locus_subagent_session_link(
+    agent_name: &str,
+    session_id: &str,
+    info: &SubagentInfo,
+    cwd: Option<&str>,
+    remove: bool,
+) {
+    let Ok(connection) = zbus::Connection::session().await else {
+        return;
+    };
+    let Ok(locus_write) = GraphWriteProxy::new(&connection).await else {
+        return;
+    };
+    let Ok(locus_read) = GraphReadProxy::new(&connection).await else {
+        return;
+    };
+
+    let target = format!(
+        "agent-session:{}",
+        agent_session_node_key(agent_name, session_id)
+    );
+    let parent = format!(
+        "agent-session:{}",
+        agent_session_node_key(agent_name, &info.parent_session_id)
+    );
+
+    for app_instance in locus_read
+        .get_sources(&target, "agent-session")
+        .await
+        .unwrap_or_default()
+    {
+        let _ = locus_write
+            .remove_link(&app_instance, "agent-session", &target)
+            .await;
+    }
+
+    if remove {
+        let _ = locus_write
+            .remove_link(&parent, SUBAGENT_SESSION_RELATION, &target)
+            .await;
+        let _ = locus_write.remove_links(&target, "session-project").await;
+        return;
+    }
+
+    let _ = locus_write
+        .set_property(&target, "kind", "agent-session")
+        .await;
+    let _ = locus_write.set_property(&target, "id", session_id).await;
+    if let Some(cwd) = cwd {
+        let _ = locus_write.set_property(&target, "cwd", cwd).await;
+    }
+    let _ = locus_write
+        .set_property(&parent, "kind", "agent-session")
+        .await;
+    let _ = locus_write
+        .set_property(&parent, "id", &info.parent_session_id)
+        .await;
+    let _ = locus_write
+        .set_link(&parent, SUBAGENT_SESSION_RELATION, &target)
+        .await;
+    let _ = locus_write.remove_links(&target, "session-project").await;
+}
+
 fn process_exists(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
@@ -817,6 +962,117 @@ fn model_name(data: &serde_json::Value) -> String {
         .or_else(|| data["model"].as_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn apply_subagent_info(session: &mut SessionObject, info: Option<&SubagentInfo>) {
+    let Some(info) = info else {
+        return;
+    };
+    session.is_subagent = true;
+    session.parent_session_id = info.parent_session_id.clone();
+    session.agent_nickname = info.nickname.clone();
+    session.agent_role = info.role.clone();
+}
+
+fn codex_subagent_info(
+    agent_name: &str,
+    session_id: &str,
+    data: &serde_json::Value,
+) -> Option<SubagentInfo> {
+    if agent_name != "codex" {
+        return None;
+    }
+
+    subagent_info_from_value(data)
+        .or_else(|| codex_session_meta_from_hook(data))
+        .or_else(|| {
+            codex_session_file(session_id).and_then(|path| codex_session_meta_from_path(&path))
+        })
+        .and_then(|meta| {
+            if meta.parent_session_id.is_empty() {
+                None
+            } else {
+                Some(meta)
+            }
+        })
+}
+
+fn subagent_info_from_value(value: &serde_json::Value) -> Option<SubagentInfo> {
+    let thread_source = json_string_at(value, &["thread_source"])
+        .or_else(|| json_string_at(value, &["payload", "thread_source"]));
+    let explicit_subagent = thread_source.as_deref() == Some("subagent")
+        || value
+            .pointer("/source/subagent/thread_spawn")
+            .is_some_and(serde_json::Value::is_object)
+        || value
+            .pointer("/payload/source/subagent/thread_spawn")
+            .is_some_and(serde_json::Value::is_object);
+
+    let parent_session_id = json_string_at(
+        value,
+        &["source", "subagent", "thread_spawn", "parent_thread_id"],
+    )
+    .or_else(|| {
+        json_string_at(
+            value,
+            &[
+                "payload",
+                "source",
+                "subagent",
+                "thread_spawn",
+                "parent_thread_id",
+            ],
+        )
+    })
+    .or_else(|| json_string_at(value, &["thread_spawn", "parent_thread_id"]))
+    .or_else(|| json_string_at(value, &["parent_thread_id"]))
+    .unwrap_or_default();
+
+    if !explicit_subagent && parent_session_id.is_empty() {
+        return None;
+    }
+
+    Some(SubagentInfo {
+        parent_session_id,
+        nickname: json_string_at(value, &["agent_nickname"])
+            .or_else(|| json_string_at(value, &["payload", "agent_nickname"]))
+            .unwrap_or_default(),
+        role: json_string_at(value, &["agent_role"])
+            .or_else(|| json_string_at(value, &["payload", "agent_role"]))
+            .unwrap_or_default(),
+    })
+}
+
+fn codex_session_meta_from_hook(data: &serde_json::Value) -> Option<SubagentInfo> {
+    let path = data["transcript_path"]
+        .as_str()
+        .or_else(|| data["session_path"].as_str())
+        .or_else(|| data["session_file"].as_str())?;
+    codex_session_meta_from_path(Path::new(path))
+}
+
+fn codex_session_meta_from_path(path: &Path) -> Option<SubagentInfo> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut contents = String::new();
+    (&mut file)
+        .take(256 * 1024)
+        .read_to_string(&mut contents)
+        .ok()?;
+    contents.lines().find_map(|line| {
+        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
+        if entry["type"].as_str()? != "session_meta" {
+            return None;
+        }
+        subagent_info_from_value(&entry["payload"])
+    })
+}
+
+fn json_string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current.as_str().map(str::to_string)
 }
 
 async fn handle_elicitation_event(
@@ -1287,6 +1543,70 @@ mod tests {
             })),
             Some(40.0)
         );
+    }
+
+    #[test]
+    fn subagent_info_parses_codex_session_meta_payload() {
+        let data = json!({
+            "id": "child-session",
+            "thread_source": "subagent",
+            "agent_nickname": "Helmholtz",
+            "agent_role": "explorer",
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "parent-session",
+                        "depth": 1
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            subagent_info_from_value(&data),
+            Some(SubagentInfo {
+                parent_session_id: "parent-session".to_string(),
+                nickname: "Helmholtz".to_string(),
+                role: "explorer".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn subagent_info_parses_nested_payload_shape() {
+        let data = json!({
+            "payload": {
+                "thread_source": "subagent",
+                "agent_nickname": "Locke",
+                "agent_role": "worker",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "parent-session"
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            subagent_info_from_value(&data),
+            Some(SubagentInfo {
+                parent_session_id: "parent-session".to_string(),
+                nickname: "Locke".to_string(),
+                role: "worker".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn subagent_info_ignores_regular_sessions() {
+        let data = json!({
+            "thread_source": "thread",
+            "agent_nickname": "main"
+        });
+
+        assert_eq!(subagent_info_from_value(&data), None);
     }
 
     #[test]
