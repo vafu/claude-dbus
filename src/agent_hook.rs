@@ -127,6 +127,7 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
         || (event == "Stop" && subagent_parent_session_id.as_deref().is_some());
 
     let app_instance = std::env::var("LOCUS_APP_INSTANCE").unwrap_or_default();
+    let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
     if !app_instance.is_empty() {
         if let Some(parent_session_id) = subagent_parent_session_id.as_deref() {
             update_locus_subagent_session_link(
@@ -146,7 +147,7 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
                 &key,
                 session_id,
                 &app_instance,
-                None,
+                (!window_id.is_empty()).then_some((agent, window_id.as_str())),
                 cwd,
                 remove,
             )
@@ -155,7 +156,6 @@ async fn record_session_links_if_present(agent: &str, event: &str, data: &serde_
         return;
     }
 
-    let window_id = std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default();
     if !window_id.is_empty() {
         if let Some(parent_session_id) = subagent_parent_session_id.as_deref() {
             update_locus_subagent_session_link(
