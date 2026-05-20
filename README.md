@@ -1,6 +1,6 @@
 # agent-dbus
 
-A Rust D-Bus service that bridges lifecycle hooks from agentic coding tools to D-Bus. It is intentionally tool-agnostic: Claude Code, Codex, or another hook-capable agent can all publish session state through the same service.
+A Rust D-Bus service that bridges lifecycle hooks from agentic coding tools to D-Bus. It is intentionally tool-agnostic: Claude Code, Codex, Gemini CLI, or another hook-capable agent can all publish session state through the same service.
 
 > **Work in progress** - agent hook schemas differ by tool and may change. The bridge keeps a stable D-Bus surface and maps known hook events onto it.
 
@@ -21,7 +21,7 @@ agent-dbus                       (long-running service)
       +-- Codex compact state watcher -> tails ~/.codex/log/codex-tui.log
 ```
 
-The service stores sessions under both agent name and session id, so `claude` and `codex` sessions can run at the same time without object-path collisions.
+The service stores sessions under both agent name and session id, so `claude`, `codex`, and `gemini` sessions can run at the same time without object-path collisions.
 
 Codex does not currently expose a `SessionEnd` command hook. For Codex hook messages, `agent-hook` includes the parent Codex process id and `agent-dbus` removes top-level session objects after that process exits. `Stop` still means turn completion for top-level sessions. Codex subagent sessions are identified from Codex session metadata and are removed when their own `Stop` hook arrives.
 
@@ -87,9 +87,12 @@ Examples:
 ```bash
 agent-hook codex Stop
 agent-hook claude PermissionRequest
+agent-hook gemini BeforeTool
 ```
 
 If `<agent-name>` is omitted, `agent-hook` uses `$AGENT_DBUS_AGENT`, or `agent` when the environment variable is unset.
+
+For Gemini CLI, `agent-hook gemini ...` prints `{}` when the bridge has no blocking response, because Gemini expects successful hooks to write a JSON object to stdout.
 
 The socket message format is:
 
@@ -134,6 +137,35 @@ Add hooks to `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`:
 ```
 
 Codex session objects are cleaned up automatically when the originating Codex process exits.
+
+## Configure Gemini CLI Hooks
+
+Add hooks to `~/.gemini/settings.json` or `<repo>/.gemini/settings.json`:
+
+```json
+{
+  "general": {
+    "defaultApprovalMode": "auto_edit"
+  },
+  "hooksConfig": {
+    "enabled": true
+  },
+  "hooks": {
+    "SessionStart":        [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini SessionStart"}]}],
+    "SessionEnd":          [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini SessionEnd"}]}],
+    "BeforeAgent":         [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini BeforeAgent"}]}],
+    "AfterAgent":          [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini AfterAgent"}]}],
+    "BeforeModel":         [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini BeforeModel"}]}],
+    "AfterModel":          [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini AfterModel"}]}],
+    "BeforeToolSelection": [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini BeforeToolSelection"}]}],
+    "AfterTool":           [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini AfterTool"}]}],
+    "PreCompress":         [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini PreCompress"}]}],
+    "Notification":        [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook gemini Notification"}]}]
+  }
+}
+```
+
+Do not enable `BeforeTool` with matcher `"*"` unless you want the bridge to ask before every tool call. Gemini hook matchers run by tool name/regex, not only when Gemini's policy engine would request confirmation. Let Gemini's native approval mode and policy engine handle tool permission prompts; the passive hooks above still publish status, model, lifecycle, notification, and post-tool updates.
 
 ## Configure Claude Code Hooks
 
@@ -237,17 +269,17 @@ busctl --user call io.github.AgentDBus /io/github/AgentDBus org.freedesktop.DBus
 | State | Trigger |
 |-------|---------|
 | `no-session` | Default before first event |
-| `idle` | `SessionStart`, `Stop`, or first status update |
-| `thinking` | `UserPromptSubmit` or `PostToolUse` |
-| `tool-use` | `PreToolUse` |
-| `compacting` | `PreCompact` |
+| `idle` | `SessionStart`, `Stop`, `AfterAgent`, or first status update |
+| `thinking` | `UserPromptSubmit`, `BeforeAgent`, `BeforeModel`, `BeforeToolSelection`, `AfterModel`, `PostToolUse`, or `AfterTool` |
+| `tool-use` | `PreToolUse` or `BeforeTool` |
+| `compacting` | `PreCompact` or `PreCompress` |
 
 ## Flags
 
 | Flag | Set by | Cleared by |
 |------|--------|------------|
-| `TaskComplete` | `Stop`, `TaskCompleted` | `SessionStart`, `UserPromptSubmit` |
-| `RequiresAttention` | `PermissionRequest`, `Elicitation`, `RequestUserInput`, `PlanModePrompt`, `AgentTurnCompleteAttention`, `ToolSuggestion`, native Codex approval aliases, `AttentionRequired` | `PostToolUse`, user response, matching `*Resolved` events, `AttentionResolved`, `UserPromptSubmit` |
+| `TaskComplete` | `Stop`, `AfterAgent`, `TaskCompleted` | `SessionStart`, `UserPromptSubmit`, `BeforeAgent` |
+| `RequiresAttention` | `PermissionRequest`, Gemini `BeforeTool`, `Elicitation`, `RequestUserInput`, `PlanModePrompt`, `AgentTurnCompleteAttention`, `ToolSuggestion`, native Codex approval aliases, `AttentionRequired` | `PostToolUse`, `AfterTool`, user response, matching `*Resolved` events, `AttentionResolved`, `UserPromptSubmit`, `BeforeAgent` |
 
 Non-blocking attention events use internal reason keys so overlapping prompts do not clear each other. `AttentionRequired` and `AttentionResolved` accept `reason`, `kind`, or `attention_kind` in the hook data; if omitted, the reason is `attention`.
 Native Codex approval aliases are `ExecApprovalRequest`, `ApplyPatchApprovalRequest`, `RequestPermissions`, and `McpServerElicitationRequest`, with matching `*Resolved` events.

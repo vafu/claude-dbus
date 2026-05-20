@@ -13,6 +13,7 @@ use crate::dbus::{
 };
 use crate::types::SessionState;
 use crate::{CodexSessionParents, EndedSessions};
+use agent_dbus::agent::is_gemini_agent;
 use agent_dbus::path::{agent_session_node_key, session_key, session_path};
 use locus::{GraphReadProxy, GraphWriteProxy};
 
@@ -330,7 +331,7 @@ pub async fn handle_hook_connection(
             }
         }
 
-        "Stop" => {
+        "Stop" | "AfterAgent" => {
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             let parent_session_id = if let Some(info) = subagent_info.as_ref() {
                 Some(info.parent_session_id.clone())
@@ -405,7 +406,7 @@ pub async fn handle_hook_connection(
             );
         }
 
-        "UserPromptSubmit" => {
+        "UserPromptSubmit" | "BeforeAgent" | "BeforeModel" | "BeforeToolSelection" => {
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
@@ -423,7 +424,58 @@ pub async fn handle_hook_connection(
             );
         }
 
-        "PreToolUse" => {
+        "AfterModel" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::Thinking;
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "BeforeTool" if is_gemini_agent(&agent_name) => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    d.state = SessionState::ToolUse;
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+            let options = build_permission_options(data);
+            let option_descriptions = build_permission_option_descriptions(data, &options);
+            let detail = build_permission_detail(data);
+            let response = handle_elicitation_event(
+                &conn,
+                &agent_name,
+                &session_id,
+                ElicitationRequest {
+                    prompt: build_permission_prompt(data),
+                    detail_kind: detail.kind,
+                    detail_text: detail.text,
+                    options,
+                    option_descriptions,
+                },
+            )
+            .await;
+            if let Some(decision) = permission_response(&agent_name, data, &response) {
+                if let Err(err) = stream.write_all(decision.as_bytes()).await {
+                    warn!(%err, "failed to write gemini tool response");
+                }
+            } else {
+                info!(agent = %agent_name, session_id = %session_id, "gemini tool request ended without an explicit response");
+            }
+        }
+
+        "PreToolUse" | "BeforeTool" => {
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
@@ -439,7 +491,7 @@ pub async fn handle_hook_connection(
             );
         }
 
-        "PostToolUse" => {
+        "PostToolUse" | "AfterTool" => {
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
@@ -473,7 +525,7 @@ pub async fn handle_hook_connection(
             }
         }
 
-        "PreCompact" => {
+        "PreCompact" | "PreCompress" => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::Compacting;
@@ -512,7 +564,7 @@ pub async fn handle_hook_connection(
                 },
             )
             .await;
-            if let Some(decision) = permission_response(data, &response) {
+            if let Some(decision) = permission_response(&agent_name, data, &response) {
                 if let Err(err) = stream.write_all(decision.as_bytes()).await {
                     warn!(%err, "failed to write permission response");
                 }
@@ -960,6 +1012,7 @@ fn model_name(data: &serde_json::Value) -> String {
     data["model"]["display_name"]
         .as_str()
         .or_else(|| data["model"].as_str())
+        .or_else(|| data["llm_request"]["model"].as_str())
         .unwrap_or("unknown")
         .to_string()
 }
@@ -1314,7 +1367,8 @@ mod tests {
             ]
         });
         let response: serde_json::Value =
-            serde_json::from_str(&permission_response(&data, "Always allow").unwrap()).unwrap();
+            serde_json::from_str(&permission_response("claude", &data, "Always allow").unwrap())
+                .unwrap();
 
         assert_eq!(
             response["hookSpecificOutput"]["decision"]["updatedPermissions"][0],
@@ -1425,7 +1479,8 @@ mod tests {
         assert_eq!(build_permission_options(&data), vec!["Allow", "Deny"]);
 
         let response: serde_json::Value =
-            serde_json::from_str(&permission_response(&data, "Always allow").unwrap()).unwrap();
+            serde_json::from_str(&permission_response("codex", &data, "Always allow").unwrap())
+                .unwrap();
         assert_eq!(
             response["hookSpecificOutput"]["decision"]["behavior"],
             "allow"
@@ -1447,7 +1502,8 @@ mod tests {
         });
 
         let response: serde_json::Value =
-            serde_json::from_str(&permission_response(&data, "Always allow").unwrap()).unwrap();
+            serde_json::from_str(&permission_response("codex", &data, "Always allow").unwrap())
+                .unwrap();
 
         assert_eq!(
             response["hookSpecificOutput"]["decision"]["execPolicyAmendment"],
@@ -1499,13 +1555,44 @@ mod tests {
             ]
         });
         let response: serde_json::Value = serde_json::from_str(
-            &permission_response(&data, "Always allow (userSettings)").unwrap(),
+            &permission_response("claude", &data, "Always allow (userSettings)").unwrap(),
         )
         .unwrap();
 
         assert_eq!(
             response["hookSpecificOutput"]["decision"]["updatedPermissions"][0],
             data["permission_suggestions"][1]
+        );
+    }
+
+    #[test]
+    fn gemini_permission_response_uses_gemini_decision_shape() {
+        let allow: serde_json::Value =
+            serde_json::from_str(&permission_response("gemini", &json!({}), "Allow").unwrap())
+                .unwrap();
+        assert_eq!(allow, json!({ "decision": "allow" }));
+
+        let deny: serde_json::Value =
+            serde_json::from_str(&permission_response("gemini-cli", &json!({}), "Deny").unwrap())
+                .unwrap();
+        assert_eq!(
+            deny,
+            json!({
+                "decision": "deny",
+                "reason": "User denied via popup"
+            })
+        );
+    }
+
+    #[test]
+    fn model_name_accepts_gemini_llm_request_shape() {
+        assert_eq!(
+            model_name(&json!({
+                "llm_request": {
+                    "model": "gemini-3-pro"
+                }
+            })),
+            "gemini-3-pro"
         );
     }
 

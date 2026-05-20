@@ -1,3 +1,5 @@
+use agent_dbus::agent::is_gemini_agent;
+
 const WRITE_DETAIL_PREVIEW_CHARS: usize = 20_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,8 +342,16 @@ fn is_decline_option(option: &str) -> bool {
     normalized == "deny" || normalized == "decline" || normalized == "cancel"
 }
 
-pub(super) fn permission_response(data: &serde_json::Value, answer: &str) -> Option<String> {
+pub(super) fn permission_response(
+    agent_name: &str,
+    data: &serde_json::Value,
+    answer: &str,
+) -> Option<String> {
     let answer = answer.trim();
+    if is_gemini_agent(agent_name) {
+        return gemini_permission_response(answer);
+    }
+
     if is_always_allow_answer(answer) {
         if let Some(prefix_rule) = codex_prefix_rule(data) {
             Some(permission_allow_response_with_exec_policy_amendment(
@@ -364,6 +374,22 @@ pub(super) fn permission_response(data: &serde_json::Value, answer: &str) -> Opt
     } else {
         None
     }
+}
+
+fn gemini_permission_response(answer: &str) -> Option<String> {
+    if is_always_allow_answer(answer) || is_allow_answer(answer) {
+        return Some(serde_json::json!({ "decision": "allow" }).to_string());
+    }
+    if answer.eq_ignore_ascii_case("deny") || answer.starts_with("Deny") {
+        return Some(
+            serde_json::json!({
+                "decision": "deny",
+                "reason": "User denied via popup"
+            })
+            .to_string(),
+        );
+    }
+    None
 }
 
 fn codex_prefix_rule(data: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {

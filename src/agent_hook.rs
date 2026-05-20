@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use agent_dbus::agent::is_gemini_agent;
 use agent_dbus::constants::socket_path;
 use agent_dbus::path::{agent_session_node_key, safe_path_segment};
 use locus::GraphReadProxy;
@@ -36,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
-        Err(_) => return Ok(()), // Service unavailable - fall through
+        Err(_) => {
+            print_empty_response_if_needed(&agent);
+            return Ok(());
+        }
     };
 
     stream.write_all(&msg_bytes)?;
@@ -47,9 +51,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !response.is_empty() {
         print!("{}", response);
+    } else {
+        print_empty_response_if_needed(&agent);
     }
 
     Ok(())
+}
+
+fn print_empty_response_if_needed(agent: &str) {
+    if is_gemini_agent(agent) {
+        print!("{{}}");
+    }
 }
 
 fn owning_process_pid() -> Option<u32> {
