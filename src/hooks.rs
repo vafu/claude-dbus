@@ -14,7 +14,7 @@ use crate::dbus::{
 use crate::types::SessionState;
 use crate::{CodexSessionParents, EndedSessions};
 use agent_dbus::agent::is_gemini_agent;
-use agent_dbus::path::{agent_session_node_key, session_key, session_path};
+use agent_dbus::path::{agent_session_node_key, safe_path_segment, session_key, session_path};
 use locus::{GraphReadProxy, GraphWriteProxy};
 
 mod metrics;
@@ -42,6 +42,8 @@ struct HookMessage {
     #[serde(default)]
     data: serde_json::Value,
     parent_pid: Option<u64>,
+    locus_app_instance: Option<String>,
+    locus_window_id: Option<String>,
 }
 
 struct ElicitationRequest {
@@ -57,6 +59,38 @@ struct SubagentInfo {
     parent_session_id: String,
     nickname: String,
     role: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocusContext {
+    app_instance: Option<String>,
+    window_id: Option<String>,
+}
+
+impl LocusContext {
+    fn from_message(msg: &HookMessage) -> Self {
+        Self {
+            app_instance: non_empty_string(msg.locus_app_instance.as_deref()),
+            window_id: non_empty_string(msg.locus_window_id.as_deref()),
+        }
+    }
+
+    fn app_instance_for(&self, agent_name: &str, session_id: &str) -> Option<String> {
+        self.app_instance.clone().or_else(|| {
+            self.window_id.as_ref().map(|_| {
+                format!(
+                    "app-instance:{}",
+                    agent_session_node_key(agent_name, session_id)
+                )
+            })
+        })
+    }
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 pub fn start_codex_compact_watcher(conn: zbus::Connection) {
@@ -242,7 +276,7 @@ pub async fn handle_hook_connection(
     };
 
     let data = &msg.data;
-    let event = msg.event.unwrap_or_default();
+    let event = msg.event.clone().unwrap_or_default();
     let agent_name = msg
         .agent
         .as_deref()
@@ -251,6 +285,7 @@ pub async fn handle_hook_connection(
         .unwrap_or("agent")
         .to_string();
     let session_id = data["session_id"].as_str().unwrap_or("unknown").to_string();
+    let locus_context = LocusContext::from_message(&msg);
     info!(agent = %agent_name, event = %event, session_id = %session_id, "hook received");
     tracing::debug!(data = %data, "hook data");
 
@@ -284,8 +319,8 @@ pub async fn handle_hook_connection(
                     if let Some(ctx_pct) = context_pct(data) {
                         d.context_pct = ctx_pct;
                     }
-                    d.model_name = model;
-                    d.cwd = cwd;
+                    d.model_name = model.clone();
+                    d.cwd = cwd.clone();
                     d.cost_usd = cost_usd;
                     apply_usage_limits(d, &agent_name, &session_id, data);
                     if d.state == SessionState::NoSession {
@@ -296,10 +331,19 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
+            publish_locus_agent_session_link(
+                &agent_name,
+                &session_id,
+                &locus_context,
+                data["cwd"].as_str(),
+                Some(&model),
+            )
+            .await;
         }
 
         "SessionStart" => {
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
+            let model = model_name(data);
             log_zbus_result(
                 create_session(&conn, &agent_name, &session_id).await,
                 "create_session",
@@ -308,7 +352,7 @@ pub async fn handle_hook_connection(
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::Idle;
-                    d.model_name = model_name(data);
+                    d.model_name = model.clone();
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
                     apply_subagent_info(d, subagent_info.as_ref());
@@ -326,6 +370,15 @@ pub async fn handle_hook_connection(
                     info,
                     data["cwd"].as_str(),
                     false,
+                )
+                .await;
+            } else {
+                publish_locus_agent_session_link(
+                    &agent_name,
+                    &session_id,
+                    &locus_context,
+                    data["cwd"].as_str(),
+                    Some(&model),
                 )
                 .await;
             }
@@ -369,12 +422,13 @@ pub async fn handle_hook_connection(
                 info!(agent = %agent_name, session_id = %session_id, "removed subagent session after Stop");
                 return;
             }
+            let model = model_name(data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     d.state = SessionState::Idle;
                     d.task_complete = true;
                     clear_pending_if_not_waiting(d);
-                    d.model_name = model_name(data);
+                    d.model_name = model.clone();
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
                 })
@@ -382,9 +436,18 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
+            publish_locus_agent_session_link(
+                &agent_name,
+                &session_id,
+                &locus_context,
+                data["cwd"].as_str(),
+                Some(&model),
+            )
+            .await;
         }
 
         "SessionEnd" => {
+            remove_locus_agent_session_link(&agent_name, &session_id, &locus_context).await;
             remove_session(
                 &conn,
                 &ended,
@@ -857,6 +920,7 @@ async fn remove_session(
     let key = session_key(agent_name, session_id);
     ended.lock().await.insert(key.clone());
     codex_session_parents.lock().await.remove(&key);
+    remove_locus_agent_session_link(agent_name, session_id, &LocusContext::default()).await;
     let path = session_path(agent_name, session_id);
     if let Ok(iface_ref) = conn
         .object_server()
@@ -890,6 +954,169 @@ async fn subagent_parent_session_id(
     let iface = iface_ref.get().await;
     (iface.is_subagent && !iface.parent_session_id.is_empty())
         .then(|| iface.parent_session_id.clone())
+}
+
+async fn publish_locus_agent_session_link(
+    agent_name: &str,
+    session_id: &str,
+    context: &LocusContext,
+    cwd: Option<&str>,
+    model: Option<&str>,
+) {
+    let Ok(connection) = zbus::Connection::session().await else {
+        return;
+    };
+    let Ok(locus_write) = GraphWriteProxy::new(&connection).await else {
+        return;
+    };
+
+    let target = format!(
+        "agent-session:{}",
+        agent_session_node_key(agent_name, session_id)
+    );
+    let _ = locus_write
+        .set_property(&target, "kind", "agent-session")
+        .await;
+    let _ = locus_write.set_property(&target, "id", session_id).await;
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+        let _ = locus_write.set_property(&target, "cwd", cwd).await;
+    }
+    if let Some(model) = model.filter(|model| !model.is_empty() && *model != "unknown") {
+        let _ = locus_write.set_property(&target, "model", model).await;
+    }
+    publish_session_project(&locus_write, &target, cwd).await;
+
+    let Some(app_instance) = context.app_instance_for(agent_name, session_id) else {
+        return;
+    };
+    if let Some(window_id) = context.window_id.as_deref() {
+        let window = format!("window:{window_id}");
+        let _ = locus_write
+            .set_property(&app_instance, "kind", "app-instance")
+            .await;
+        let _ = locus_write
+            .set_property(&app_instance, "name", agent_name)
+            .await;
+        let _ = locus_write
+            .set_property(&app_instance, "icon", &safe_path_segment(agent_name))
+            .await;
+        let _ = locus_write
+            .set_link(&window, "app-instance", &app_instance)
+            .await;
+    }
+    let _ = locus_write
+        .set_link(&app_instance, "agent-session", &target)
+        .await;
+}
+
+async fn remove_locus_agent_session_link(
+    agent_name: &str,
+    session_id: &str,
+    context: &LocusContext,
+) {
+    let Ok(connection) = zbus::Connection::session().await else {
+        return;
+    };
+    let Ok(locus_write) = GraphWriteProxy::new(&connection).await else {
+        return;
+    };
+    let Ok(locus_read) = GraphReadProxy::new(&connection).await else {
+        return;
+    };
+
+    let target = format!(
+        "agent-session:{}",
+        agent_session_node_key(agent_name, session_id)
+    );
+    remove_existing_top_level_session_links(&locus_write, &locus_read, &target).await;
+    let _ = locus_write.remove_links(&target, "session-project").await;
+    if let Some(app_instance) = context.app_instance_for(agent_name, session_id)
+        && let Some(window_id) = context.window_id.as_deref()
+    {
+        let window = format!("window:{window_id}");
+        let _ = locus_write
+            .remove_link(&window, "app-instance", &app_instance)
+            .await;
+    }
+    let _ = locus_write.delete_node(&target).await;
+}
+
+async fn remove_existing_top_level_session_links(
+    locus: &GraphWriteProxy<'_>,
+    locus_read: &GraphReadProxy<'_>,
+    target: &str,
+) {
+    for app_instance in locus_read
+        .get_sources(target, "agent-session")
+        .await
+        .unwrap_or_default()
+    {
+        let _ = locus
+            .remove_link(&app_instance, "agent-session", target)
+            .await;
+    }
+}
+
+async fn publish_session_project(locus: &GraphWriteProxy<'_>, session: &str, cwd: Option<&str>) {
+    let Some(project) = cwd.and_then(project_for_cwd) else {
+        return;
+    };
+    let subject = format!("project:{}", project.root.display());
+
+    let _ = locus.set_property(&subject, "kind", "project").await;
+    let _ = locus
+        .set_property(&subject, "path", &project.root.display().to_string())
+        .await;
+    let _ = locus.set_property(&subject, "name", &project.name).await;
+    if let Some(icon) = project.icon.as_deref().filter(|icon| !icon.is_empty()) {
+        let _ = locus.set_property(&subject, "icon", icon).await;
+    }
+    let _ = locus.set_link(session, "session-project", &subject).await;
+}
+
+struct Project {
+    root: PathBuf,
+    name: String,
+    icon: Option<String>,
+}
+
+fn project_for_cwd(cwd: &str) -> Option<Project> {
+    let cwd = std::fs::canonicalize(cwd).ok()?;
+    let parent = project_parent()?;
+    let relative = cwd.strip_prefix(&parent).ok()?;
+    let project_name = relative.components().next()?.as_os_str().to_str()?;
+    if project_name.is_empty() {
+        return None;
+    }
+
+    let root = parent.join(project_name);
+    let metadata = read_project_metadata(&root);
+    Some(Project {
+        root,
+        name: metadata
+            .as_ref()
+            .and_then(|value| json_string(value, "name"))
+            .unwrap_or_else(|| project_name.to_string()),
+        icon: metadata
+            .as_ref()
+            .and_then(|value| json_string(value, "icon")),
+    })
+}
+
+fn project_parent() -> Option<PathBuf> {
+    let parent = std::env::var_os("PROJECT_PARENT")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join("proj")))?;
+    std::fs::canonicalize(parent).ok()
+}
+
+fn read_project_metadata(root: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(root.join(".project.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(str::to_string)
 }
 
 async fn publish_locus_subagent_session_link(

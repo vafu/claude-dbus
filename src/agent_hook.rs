@@ -30,6 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "data": data,
         "hook_pid": std::process::id(),
         "parent_pid": owning_process_pid(),
+        "locus_app_instance": std::env::var("LOCUS_APP_INSTANCE").unwrap_or_default(),
+        "locus_window_id": std::env::var("AGENT_DBUS_WINDOW_ID").unwrap_or_default(),
     });
     let msg_bytes = serde_json::to_vec(&msg)?;
 
