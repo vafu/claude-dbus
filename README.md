@@ -136,6 +136,8 @@ Add hooks to `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`:
 }
 ```
 
+When Codex auto-review is enabled (`approvals_reviewer = "auto_review"` or `"guardian_subagent"`), `agent-dbus` defers the initial `PermissionRequest` hook without showing a dialog so Codex's reviewer can decide first. Dialogs are shown only for payloads that identify a reviewer-denied fallback, or when Codex is using the normal user reviewer.
+
 Codex session objects are cleaned up automatically when the originating Codex process exits.
 
 ## Configure Gemini CLI Hooks

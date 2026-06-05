@@ -112,6 +112,8 @@ Create `~/.codex/hooks.json` with:
 ```
 
 These hooks cover session creation, prompt submission, tool activity, approval prompts, and turn completion.
+
+When Codex auto-review is enabled (`approvals_reviewer = "auto_review"` or `"guardian_subagent"`), `agent-dbus` defers the initial `PermissionRequest` hook without showing a dialog so Codex's reviewer can decide first. Dialogs are shown only for payloads that identify a reviewer-denied fallback, or when Codex is using the normal user reviewer.
 Codex does not currently expose a separate session-end hook; `agent-dbus` removes top-level session objects when the originating Codex process exits. Spawned Codex subagents are identified from Codex session metadata and removed when their own `Stop` hook arrives.
 Codex also does not currently expose a compact lifecycle hook. `agent-dbus` detects Codex compaction by watching `~/.codex/log/codex-tui.log` for `op.dispatch.compact` start/close lines and updates the matching session state to `compacting` while that task is active.
 

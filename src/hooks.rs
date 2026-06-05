@@ -26,6 +26,7 @@ use metrics::{apply_usage_limits, codex_session_file, context_pct};
 use permission::{
     build_elicitation_options, build_permission_detail, build_permission_option_descriptions,
     build_permission_options, build_permission_prompt, permission_response,
+    should_defer_codex_permission_to_auto_review,
 };
 
 const SUBAGENT_SESSION_RELATION: &str = "subagent-session";
@@ -611,6 +612,10 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
+            if should_defer_codex_permission_to_auto_review(&agent_name, data) {
+                info!(agent = %agent_name, session_id = %session_id, "deferred codex permission request to auto-review");
+                return;
+            }
             let options = build_permission_options(data);
             let option_descriptions = build_permission_option_descriptions(data, &options);
             let detail = build_permission_detail(data);
@@ -1717,6 +1722,49 @@ mod tests {
                 .get("execPolicyAmendment")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn codex_permission_request_defers_to_auto_review() {
+        let data = json!({
+            "hook_event_name": "PermissionRequest",
+            "permission_mode": "default",
+            "transcript_path": "/tmp/codex-session.jsonl",
+            "approvals_reviewer": "auto_review"
+        });
+
+        assert!(should_defer_codex_permission_to_auto_review("codex", &data));
+    }
+
+    #[test]
+    fn codex_permission_request_shows_auto_review_denied_fallback() {
+        let data = json!({
+            "hook_event_name": "PermissionRequest",
+            "permission_mode": "default",
+            "transcript_path": "/tmp/codex-session.jsonl",
+            "approvals_reviewer": "auto_review",
+            "auto_review": {
+                "status": "denied"
+            }
+        });
+
+        assert!(!should_defer_codex_permission_to_auto_review(
+            "codex", &data
+        ));
+    }
+
+    #[test]
+    fn codex_permission_request_does_not_defer_user_reviewer() {
+        let data = json!({
+            "hook_event_name": "PermissionRequest",
+            "permission_mode": "default",
+            "transcript_path": "/tmp/codex-session.jsonl",
+            "approvals_reviewer": "user"
+        });
+
+        assert!(!should_defer_codex_permission_to_auto_review(
+            "codex", &data
+        ));
     }
 
     #[test]
