@@ -1,5 +1,4 @@
-use agent_dbus::agent::is_gemini_agent;
-use std::path::PathBuf;
+use crate::providers::{codex, gemini};
 
 const WRITE_DETAIL_PREVIEW_CHARS: usize = 20_000;
 
@@ -167,7 +166,7 @@ pub(super) fn build_permission_options(data: &serde_json::Value) -> Vec<String> 
             }
         })
         .collect();
-    if always_allow_options.is_empty() && codex_prefix_rule(data).is_some() {
+    if always_allow_options.is_empty() && codex::permissions::prefix_rule(data).is_some() {
         always_allow_options.push("Always allow".to_string());
     }
     options.append(&mut always_allow_options);
@@ -185,149 +184,11 @@ pub(super) fn build_permission_option_descriptions(
         .collect()
 }
 
-fn is_codex_permission_request(data: &serde_json::Value) -> bool {
-    data["hook_event_name"].as_str() == Some("PermissionRequest")
-        && data["transcript_path"].as_str().is_some()
-        && data["permission_mode"].as_str().is_some()
-}
-
 pub(super) fn should_defer_codex_permission_to_auto_review(
     agent_name: &str,
     data: &serde_json::Value,
 ) -> bool {
-    if agent_name != "codex" || !is_codex_permission_request(data) {
-        return false;
-    }
-    if codex_permission_request_is_auto_review_fallback(data) {
-        return false;
-    }
-
-    if let Some(reviewer) = codex_payload_approval_reviewer(data) {
-        return is_codex_auto_approval_reviewer(reviewer);
-    }
-
-    codex_config_approval_reviewer()
-        .as_deref()
-        .is_some_and(is_codex_auto_approval_reviewer)
-}
-
-fn codex_permission_request_is_auto_review_fallback(data: &serde_json::Value) -> bool {
-    [
-        &data["auto_review_denied"],
-        &data["guardian_denied"],
-        &data["auto_approval_declined"],
-        &data["approval_review"]["denied"],
-        &data["auto_review"]["denied"],
-        &data["guardian_assessment"]["denied"],
-    ]
-    .iter()
-    .any(|value| value.as_bool() == Some(true))
-        || [
-            &data["approval_review"]["status"],
-            &data["approval_review"]["decision"],
-            &data["auto_review"]["status"],
-            &data["auto_review"]["decision"],
-            &data["guardian_assessment"]["status"],
-            &data["guardian_assessment"]["decision"],
-            &data["guardian_assessment"]["user_authorization"],
-            &data["guardian_assessment"]["action"],
-            &data["review_status"],
-            &data["review_decision"],
-        ]
-        .iter()
-        .filter_map(|value| value.as_str())
-        .any(is_auto_review_decline_value)
-        || decision_source_is_auto_reviewer(data)
-            && [
-                &data["decision"],
-                &data["status"],
-                &data["user_authorization"],
-                &data["approval_decision"],
-            ]
-            .iter()
-            .filter_map(|value| value.as_str())
-            .any(is_auto_review_decline_value)
-}
-
-fn decision_source_is_auto_reviewer(data: &serde_json::Value) -> bool {
-    [
-        &data["decision_source"],
-        &data["approval_review"]["decision_source"],
-        &data["auto_review"]["decision_source"],
-        &data["guardian_assessment"]["decision_source"],
-    ]
-    .iter()
-    .filter_map(|value| value.as_str())
-    .any(is_codex_auto_approval_reviewer)
-}
-
-fn is_auto_review_decline_value(value: &str) -> bool {
-    matches!(
-        normalize_permission_value(value).as_str(),
-        "denied"
-            | "deny"
-            | "declined"
-            | "decline"
-            | "rejected"
-            | "reject"
-            | "aborted"
-            | "abort"
-            | "blocked"
-            | "block"
-    )
-}
-
-fn codex_payload_approval_reviewer(data: &serde_json::Value) -> Option<&str> {
-    [
-        &data["approvals_reviewer"],
-        &data["approval_reviewer"],
-        &data["approval_review_mode"],
-        &data["reviewer"],
-        &data["approval"]["reviewer"],
-        &data["approval"]["reviewer_mode"],
-        &data["approval_review"]["reviewer"],
-        &data["approval_review"]["mode"],
-        &data["auto_review"]["reviewer"],
-        &data["guardian_assessment"]["reviewer"],
-    ]
-    .iter()
-    .find_map(|value| value.as_str())
-}
-
-fn is_codex_auto_approval_reviewer(value: &str) -> bool {
-    matches!(
-        normalize_permission_value(value).as_str(),
-        "auto_review" | "autoreview" | "guardian_subagent" | "guardiansubagent" | "guardian"
-    )
-}
-
-fn normalize_permission_value(value: &str) -> String {
-    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
-}
-
-fn codex_config_approval_reviewer() -> Option<String> {
-    let path = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?
-        .join("config.toml");
-    let config = std::fs::read_to_string(path).ok()?;
-    parse_codex_config_approval_reviewer(&config)
-}
-
-fn parse_codex_config_approval_reviewer(config: &str) -> Option<String> {
-    config.lines().find_map(|line| {
-        let line = line.split_once('#').map_or(line, |(line, _)| line).trim();
-        let (key, value) = line.split_once('=')?;
-        (key.trim() == "approvals_reviewer")
-            .then(|| {
-                value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string()
-            })
-            .filter(|value| !value.is_empty())
-    })
+    codex::permissions::should_defer_permission_to_auto_review(agent_name, data)
 }
 
 fn permission_suggestion_label(suggestion: &serde_json::Value) -> String {
@@ -351,7 +212,7 @@ fn permission_option_description(data: &serde_json::Value, option: &str) -> Stri
         return String::new();
     }
 
-    if let Some(prefix_rule) = codex_prefix_rule(data) {
+    if let Some(prefix_rule) = codex::permissions::prefix_rule(data) {
         return format!(
             "Persistently allow commands starting with: {}",
             format_rule_values(prefix_rule)
@@ -488,12 +349,12 @@ pub(super) fn permission_response(
     answer: &str,
 ) -> Option<String> {
     let answer = answer.trim();
-    if is_gemini_agent(agent_name) {
-        return gemini_permission_response(answer);
+    if gemini::is_gemini_agent(agent_name) {
+        return gemini::permission_response(answer);
     }
 
     if is_always_allow_answer(answer) {
-        if let Some(prefix_rule) = codex_prefix_rule(data) {
+        if let Some(prefix_rule) = codex::permissions::prefix_rule(data) {
             Some(permission_allow_response_with_exec_policy_amendment(
                 prefix_rule.clone(),
             ))
@@ -514,29 +375,6 @@ pub(super) fn permission_response(
     } else {
         None
     }
-}
-
-fn gemini_permission_response(answer: &str) -> Option<String> {
-    if is_always_allow_answer(answer) || is_allow_answer(answer) {
-        return Some(serde_json::json!({ "decision": "allow" }).to_string());
-    }
-    if answer.eq_ignore_ascii_case("deny") || answer.starts_with("Deny") {
-        return Some(
-            serde_json::json!({
-                "decision": "deny",
-                "reason": "User denied via popup"
-            })
-            .to_string(),
-        );
-    }
-    None
-}
-
-fn codex_prefix_rule(data: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    if !is_codex_permission_request(data) {
-        return None;
-    }
-    data["prefix_rule"].as_array()
 }
 
 fn is_allow_answer(answer: &str) -> bool {

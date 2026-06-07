@@ -1,0 +1,25 @@
+[package]
+name = "agent-dbus"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "agent-dbus"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent-hook"
+path = "src/agent_hook.rs"
+
+[[bin]]
+name = "agent-respond"
+path = "src/agent_respond.rs"
+
+[dependencies]
+agent-dbus-core = { path = "../agent-dbus-core" }
+zbus = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

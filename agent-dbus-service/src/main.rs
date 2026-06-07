@@ -8,10 +8,14 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::connection;
 
-use agent_dbus::constants::{BUS_NAME, ROOT_PATH, socket_path};
+use agent_dbus_core::constants::{BUS_NAME, ROOT_PATH, socket_path};
 
 mod dbus;
-mod hooks;
+mod providers;
+mod request_broker;
+mod service;
+mod session_store;
+mod socket;
 mod types;
 
 pub type EndedSessions = Arc<Mutex<ExpiringSessionSet>>;
@@ -97,8 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(10 * 60),
     )));
     let codex_session_parents: CodexSessionParents = Arc::new(Mutex::new(HashMap::new()));
-    hooks::start_codex_compact_watcher(conn.clone());
-    hooks::start_codex_parent_watcher(
+    providers::codex::compact::start_codex_compact_watcher(conn.clone());
+    providers::codex::title::start_codex_title_watcher(conn.clone());
+    providers::codex::parent::start_codex_parent_watcher(
         conn.clone(),
         Arc::clone(&ended),
         Arc::clone(&codex_session_parents),
@@ -111,7 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ended = Arc::clone(&ended);
                 let codex_session_parents = Arc::clone(&codex_session_parents);
                 tokio::spawn(async move {
-                    hooks::handle_hook_connection(stream, conn, ended, codex_session_parents).await;
+                    service::handle_hook_connection(stream, conn, ended, codex_session_parents)
+                        .await;
                 });
             }
             Err(e) => info!("Socket accept error: {}", e),

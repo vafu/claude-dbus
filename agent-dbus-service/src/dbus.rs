@@ -3,8 +3,9 @@ use std::collections::{BTreeSet, VecDeque};
 use tracing::{debug, warn};
 use zbus::{interface, object_server::SignalEmitter};
 
+use crate::request_broker::global_request_broker;
 use crate::types::SessionState;
-use agent_dbus::path::session_path;
+use agent_dbus_core::path::session_path;
 
 const MAX_PENDING_REQUESTS_PER_SESSION: usize = 4;
 
@@ -15,15 +16,18 @@ pub struct PendingRequest {
     pub detail_text: String,
     pub options: Vec<String>,
     pub option_descriptions: Vec<String>,
-    pub tx: tokio::sync::oneshot::Sender<String>,
 }
 
 pub struct SessionObject {
+    pub session_id: String,
     pub agent_name: String,
+    pub app_instance_id: String,
+    pub window_id: String,
     pub is_subagent: bool,
     pub parent_session_id: String,
     pub agent_nickname: String,
     pub agent_role: String,
+    pub session_title: String,
     pub state: SessionState,
     pub task_complete: bool,
     pub requires_attention: bool,
@@ -41,11 +45,15 @@ pub struct SessionObject {
 
 #[derive(PartialEq)]
 struct SessionSnapshot {
+    session_id: String,
     agent_name: String,
+    app_instance_id: String,
+    window_id: String,
     is_subagent: bool,
     parent_session_id: String,
     agent_nickname: String,
     agent_role: String,
+    session_title: String,
     state: SessionState,
     task_complete: bool,
     requires_attention: bool,
@@ -75,11 +83,15 @@ struct SessionSnapshot {
 impl Default for SessionObject {
     fn default() -> Self {
         Self {
+            session_id: String::new(),
             agent_name: String::new(),
+            app_instance_id: String::new(),
+            window_id: String::new(),
             is_subagent: false,
             parent_session_id: String::new(),
             agent_nickname: String::new(),
             agent_role: String::new(),
+            session_title: String::new(),
             state: SessionState::NoSession,
             task_complete: false,
             requires_attention: false,
@@ -98,8 +110,9 @@ impl Default for SessionObject {
 }
 
 impl SessionObject {
-    pub fn new(agent_name: &str) -> Self {
+    pub fn new(agent_name: &str, session_id: &str) -> Self {
         Self {
+            session_id: session_id.to_string(),
             agent_name: agent_name.to_string(),
             ..Self::default()
         }
@@ -205,11 +218,15 @@ impl SessionObject {
 
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
+            session_id: self.session_id.clone(),
             agent_name: self.agent_name.clone(),
+            app_instance_id: self.app_instance_id.clone(),
+            window_id: self.window_id.clone(),
             is_subagent: self.is_subagent,
             parent_session_id: self.parent_session_id.clone(),
             agent_nickname: self.agent_nickname.clone(),
             agent_role: self.agent_role.clone(),
+            session_title: self.session_title.clone(),
             state: self.state.clone(),
             task_complete: self.task_complete,
             requires_attention: self.requires_attention,
@@ -273,10 +290,7 @@ impl SessionObject {
         }
     }
 
-    fn take_pending_response(
-        &mut self,
-        request_id: Option<&str>,
-    ) -> Option<tokio::sync::oneshot::Sender<String>> {
+    fn take_pending_response(&mut self, request_id: Option<&str>) -> Option<String> {
         let request = match request_id {
             Some(request_id) => {
                 let index = self
@@ -288,7 +302,7 @@ impl SessionObject {
             None => self.pending_requests.pop_front()?,
         };
         self.refresh_requires_attention();
-        Some(request.tx)
+        Some(request.id)
     }
 
     pub fn push_pending_request(&mut self, request: PendingRequest) -> bool {
@@ -319,7 +333,7 @@ impl SessionObject {
         self.refresh_requires_attention();
         let count = requests.len();
         for request in requests {
-            let _ = request.tx.send(String::new());
+            global_request_broker().cancel(&request.id);
         }
         count
     }
@@ -370,62 +384,56 @@ impl SessionObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::oneshot;
 
-    fn pending_request(id: &str) -> (PendingRequest, oneshot::Receiver<String>) {
-        let (tx, rx) = oneshot::channel();
-        (
-            PendingRequest {
-                id: id.to_string(),
-                prompt: format!("prompt {id}"),
-                detail_kind: "text".to_string(),
-                detail_text: format!("detail {id}"),
-                options: vec!["Allow".to_string(), "Deny".to_string()],
-                option_descriptions: vec![
-                    "Allow this request".to_string(),
-                    "Deny this request".to_string(),
-                ],
-                tx,
-            },
-            rx,
-        )
+    fn pending_request(id: &str) -> PendingRequest {
+        PendingRequest {
+            id: id.to_string(),
+            prompt: format!("prompt {id}"),
+            detail_kind: "text".to_string(),
+            detail_text: format!("detail {id}"),
+            options: vec!["Allow".to_string(), "Deny".to_string()],
+            option_descriptions: vec![
+                "Allow this request".to_string(),
+                "Deny this request".to_string(),
+            ],
+        }
     }
 
     #[test]
     fn pending_requests_are_fifo_for_legacy_response() {
-        let mut session = SessionObject::new("codex");
-        let (first, _first_rx) = pending_request("req-1");
-        let (second, _second_rx) = pending_request("req-2");
+        let mut session = SessionObject::new("codex", "session-1");
+        let first = pending_request("req-1");
+        let second = pending_request("req-2");
         session.push_pending_request(first);
         session.push_pending_request(second);
 
-        let tx = session.take_pending_response(None);
+        let request_id = session.take_pending_response(None);
 
-        assert!(tx.is_some());
+        assert_eq!(request_id.as_deref(), Some("req-1"));
         assert_eq!(session.pending_request_ids_value(), vec!["req-2"]);
         assert!(session.requires_attention);
     }
 
     #[test]
     fn pending_requests_can_be_removed_by_id() {
-        let mut session = SessionObject::new("codex");
-        let (first, _first_rx) = pending_request("req-1");
-        let (second, _second_rx) = pending_request("req-2");
+        let mut session = SessionObject::new("codex", "session-1");
+        let first = pending_request("req-1");
+        let second = pending_request("req-2");
         session.push_pending_request(first);
         session.push_pending_request(second);
 
-        let tx = session.take_pending_response(Some("req-2"));
+        let request_id = session.take_pending_response(Some("req-2"));
 
-        assert!(tx.is_some());
+        assert_eq!(request_id.as_deref(), Some("req-2"));
         assert_eq!(session.pending_request_ids_value(), vec!["req-1"]);
         assert!(session.requires_attention);
     }
 
     #[test]
     fn pending_detail_values_track_oldest_and_all_requests() {
-        let mut session = SessionObject::new("codex");
-        let (first, _first_rx) = pending_request("req-1");
-        let (second, _second_rx) = pending_request("req-2");
+        let mut session = SessionObject::new("codex", "session-1");
+        let first = pending_request("req-1");
+        let second = pending_request("req-2");
         session.push_pending_request(first);
         session.push_pending_request(second);
 
@@ -438,23 +446,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cancel_pending_requests_answers_empty_and_clears_attention() {
-        let mut session = SessionObject::new("codex");
-        let (request, rx) = pending_request("req-1");
+    #[test]
+    fn cancel_pending_requests_clears_attention() {
+        let mut session = SessionObject::new("codex", "session-1");
+        let request = pending_request("req-1");
         session.push_pending_request(request);
 
         assert_eq!(session.cancel_pending_requests(), 1);
 
-        assert_eq!(rx.await.unwrap(), "");
         assert!(session.pending_requests.is_empty());
         assert!(!session.requires_attention);
     }
 
     #[test]
     fn attention_reasons_include_pending_requests_and_nonblocking_reasons() {
-        let mut session = SessionObject::new("codex");
-        let (request, _rx) = pending_request("req-1");
+        let mut session = SessionObject::new("codex", "session-1");
+        let request = pending_request("req-1");
 
         session.push_pending_request(request);
         session.set_attention_reason("plan-mode-prompt");
@@ -472,8 +479,17 @@ async fn emit_changed_properties(
     before: &SessionSnapshot,
     after: &SessionSnapshot,
 ) -> zbus::Result<()> {
+    if before.session_id != after.session_id {
+        iface.session_id_changed(emitter).await?;
+    }
     if before.agent_name != after.agent_name {
         iface.agent_name_changed(emitter).await?;
+    }
+    if before.app_instance_id != after.app_instance_id {
+        iface.app_instance_id_changed(emitter).await?;
+    }
+    if before.window_id != after.window_id {
+        iface.window_id_changed(emitter).await?;
     }
     if before.is_subagent != after.is_subagent {
         iface.is_subagent_changed(emitter).await?;
@@ -486,6 +502,9 @@ async fn emit_changed_properties(
     }
     if before.agent_role != after.agent_role {
         iface.agent_role_changed(emitter).await?;
+    }
+    if before.session_title != after.session_title {
+        iface.session_title_changed(emitter).await?;
     }
     if before.state != after.state {
         iface.state_changed(emitter).await?;
@@ -567,8 +586,23 @@ async fn emit_changed_properties(
 #[interface(name = "io.github.AgentDBus1.Session")]
 impl SessionObject {
     #[zbus(property)]
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[zbus(property)]
     fn agent_name(&self) -> &str {
         &self.agent_name
+    }
+
+    #[zbus(property)]
+    fn app_instance_id(&self) -> &str {
+        &self.app_instance_id
+    }
+
+    #[zbus(property)]
+    fn window_id(&self) -> &str {
+        &self.window_id
     }
 
     #[zbus(property)]
@@ -589,6 +623,11 @@ impl SessionObject {
     #[zbus(property)]
     fn agent_role(&self) -> &str {
         &self.agent_role
+    }
+
+    #[zbus(property)]
+    fn session_title(&self) -> &str {
+        &self.session_title
     }
 
     #[zbus(property)]
@@ -717,9 +756,9 @@ impl SessionObject {
         answer: &str,
     ) {
         if !answer.is_empty()
-            && let Some(tx) = self.take_pending_response(None)
+            && let Some(request_id) = self.take_pending_response(None)
         {
-            let _ = tx.send(answer.to_string());
+            global_request_broker().respond(&request_id, answer.to_string());
             if let Err(err) = self.emit_pending_changed(&emitter).await {
                 warn!(%err, "failed to emit pending response properties");
             }
@@ -734,9 +773,9 @@ impl SessionObject {
     ) {
         if !request_id.is_empty()
             && !answer.is_empty()
-            && let Some(tx) = self.take_pending_response(Some(request_id))
+            && let Some(pending_request_id) = self.take_pending_response(Some(request_id))
         {
-            let _ = tx.send(answer.to_string());
+            global_request_broker().respond(&pending_request_id, answer.to_string());
             if let Err(err) = self.emit_pending_changed(&emitter).await {
                 warn!(%err, "failed to emit pending response properties");
             }
@@ -835,7 +874,7 @@ pub async fn create_session(
     let path = session_path(agent_name, session_id);
     if let Err(err) = conn
         .object_server()
-        .at(&path, SessionObject::new(agent_name))
+        .at(&path, SessionObject::new(agent_name, session_id))
         .await
     {
         warn!(%err, %session_id, "failed to create session object");
@@ -852,7 +891,7 @@ pub async fn update_session(
     let path = session_path(agent_name, session_id);
     let created = conn
         .object_server()
-        .at(&path, SessionObject::new(agent_name))
+        .at(&path, SessionObject::new(agent_name, session_id))
         .await
         .map_err(|err| {
             warn!(%err, %session_id, "failed to ensure session object");
@@ -869,6 +908,7 @@ pub async fn update_session(
         let mut iface = iface_ref.get_mut().await;
         let before = iface.snapshot();
         iface.agent_name = agent_name.to_string();
+        iface.session_id = session_id.to_string();
         f(&mut iface);
         let after = iface.snapshot();
         (before, after)
@@ -884,6 +924,35 @@ pub async fn update_session(
         model = %iface.model_name,
         "session updated"
     );
+    emit_changed_properties(&iface, emitter, &before, &after).await?;
+    Ok(())
+}
+
+pub async fn update_existing_session(
+    conn: &zbus::Connection,
+    agent_name: &str,
+    session_id: &str,
+    f: impl FnOnce(&mut SessionObject),
+) -> zbus::Result<()> {
+    let path = session_path(agent_name, session_id);
+    let Ok(iface_ref) = conn
+        .object_server()
+        .interface::<_, SessionObject>(&path)
+        .await
+    else {
+        return Ok(());
+    };
+    let (before, after) = {
+        let mut iface = iface_ref.get_mut().await;
+        let before = iface.snapshot();
+        iface.agent_name = agent_name.to_string();
+        iface.session_id = session_id.to_string();
+        f(&mut iface);
+        let after = iface.snapshot();
+        (before, after)
+    };
+    let emitter = iface_ref.signal_emitter();
+    let iface = iface_ref.get().await;
     emit_changed_properties(&iface, emitter, &before, &after).await?;
     Ok(())
 }

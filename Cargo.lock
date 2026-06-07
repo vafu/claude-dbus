@@ -6,8 +6,30 @@ version = 4
 name = "agent-dbus"
 version = "0.1.0"
 dependencies = [
- "locus-dbus",
+ "agent-dbus-core",
  "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
+name = "agent-dbus-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zbus",
+]
+
+[[package]]
+name = "agent-dbus-locus-proxy"
+version = "0.1.0"
+dependencies = [
+ "agent-dbus-core",
+ "locus-dbus",
  "serde_json",
  "tokio",
  "tracing",

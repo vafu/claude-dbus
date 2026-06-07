@@ -19,6 +19,9 @@ agent-dbus                       (long-running service)
       +-- ObjectManager signals for session lifecycle
       +-- blocking approval/input requests -> waits for RespondToElicitation or RespondToElicitationById
       +-- Codex compact state watcher -> tails ~/.codex/log/codex-tui.log
+      |
+      v optional
+agent-dbus-locus-proxy           (mirrors D-Bus sessions into Locus metadata)
 ```
 
 The service stores sessions under both agent name and session id, so `claude`, `codex`, and `gemini` sessions can run at the same time without object-path collisions.
@@ -37,7 +40,8 @@ Codex also does not expose a compact lifecycle hook. To surface `compacting` sta
 
 ```bash
 cargo build --release
-cargo install --release --path .
+cargo install --release --path agent-dbus-service
+cargo install --release --path agent-dbus-locus-proxy
 ```
 
 This installs:
@@ -45,6 +49,7 @@ This installs:
 - `agent-dbus` - the long-running D-Bus service
 - `agent-hook` - the command invoked by agent hooks
 - `agent-respond` - a terminal helper for answering pending requests
+- `agent-dbus-locus-proxy` - optional D-Bus-to-Locus metadata mirror
 
 ## Start The Service
 
@@ -74,6 +79,10 @@ Or run it in a terminal:
 agent-dbus
 ```
 
+## Locus Proxy
+
+`agent-dbus` does not write Locus directly. Run `agent-dbus-locus-proxy` if you want active D-Bus sessions mirrored into Locus as `agent-session:<agent>/<session-id>` nodes with window/app/project/subagent links.
+
 ## Hook CLI
 
 Use:
@@ -97,7 +106,7 @@ For Gemini CLI, `agent-hook gemini ...` prints `{}` when the bridge has no block
 The socket message format is:
 
 ```json
-{"agent":"codex","event":"Stop","data":{ "...": "agent hook input" }}
+{"agent":"codex","event":"Stop","data":{ "...": "agent hook input" },"app_instance_id":"...","window_id":"..."}
 ```
 
 ## Answer From A Terminal
@@ -211,11 +220,15 @@ Use `GetManagedObjects` to list all active sessions.
 
 | Property | Type | Description |
 |----------|------|-------------|
+| `SessionId` | `s` | Original hook session id |
 | `AgentName` | `s` | Agent backend name, such as `codex` or `claude` |
+| `AppInstanceId` | `s` | App instance id supplied by hook environment, for metadata mirrors |
+| `WindowId` | `s` | Window id supplied by hook environment, for metadata mirrors |
 | `IsSubagent` | `b` | `true` when the session is a spawned subagent |
 | `ParentSessionId` | `s` | Parent session id for subagents |
 | `AgentNickname` | `s` | Codex subagent nickname when supplied |
 | `AgentRole` | `s` | Codex subagent role, such as `explorer` or `worker`, when supplied |
+| `SessionTitle` | `s` | Codex thread/session title when available, including automatic titles and manual renames |
 | `State` | `s` | `no-session`, `idle`, `thinking`, `tool-use`, `compacting` |
 | `TaskComplete` | `b` | `true` when the current task/turn completes |
 | `RequiresAttention` | `b` | `true` when an approval/input request, Plan mode prompt, tool suggestion, or turn-complete attention marker is waiting |

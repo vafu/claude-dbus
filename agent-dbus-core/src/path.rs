@@ -33,7 +33,6 @@ pub fn agent_session_node_key(agent_name: &str, session_id: &str) -> String {
     )
 }
 
-#[allow(dead_code)]
 pub fn session_key(agent_name: &str, session_id: &str) -> String {
     format!("{}:{}", agent_name, session_id)
 }

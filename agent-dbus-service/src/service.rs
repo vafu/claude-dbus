@@ -1,51 +1,47 @@
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::io::AsyncWriteExt;
+use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
-use crate::dbus::{
-    PendingRequest, SessionObject, create_session, emit_elicitation, emit_elicitation_with_details,
-    emit_elicitation_with_id, emit_elicitation_with_id_and_details, emit_notification,
-    update_session,
+use crate::dbus::{PendingRequest, SessionObject};
+use crate::providers::codex::parent::maybe_watch_codex_parent;
+use crate::providers::codex::subagent::{SubagentInfo, codex_subagent_info};
+use crate::providers::codex::title::codex_thread_title;
+use crate::providers::gemini::is_gemini_agent;
+use crate::request_broker::global_request_broker;
+use crate::session_store::{
+    create_session, emit_elicitation, emit_elicitation_with_details, emit_elicitation_with_id,
+    emit_elicitation_with_id_and_details, emit_notification, log_zbus_result, remove_session,
+    subagent_parent_session_id, update_session,
 };
+use crate::socket::read_raw_hook;
 use crate::types::SessionState;
 use crate::{CodexSessionParents, EndedSessions};
-use agent_dbus::agent::is_gemini_agent;
-use agent_dbus::path::{agent_session_node_key, safe_path_segment, session_key, session_path};
-use locus::{GraphReadProxy, GraphWriteProxy};
+use agent_dbus_core::path::{session_key, session_path};
 
 mod metrics;
 mod permission;
 
 #[cfg(test)]
-use metrics::codex_context_pct;
-use metrics::{apply_usage_limits, codex_session_file, context_pct};
+use crate::providers::codex::compact::{CodexCompactLogEvent, parse_codex_compact_log_line};
+#[cfg(test)]
+use crate::providers::codex::metrics::codex_context_pct;
+#[cfg(test)]
+use crate::providers::codex::subagent::subagent_info_from_value;
+#[cfg(test)]
+use crate::providers::codex::title::parse_codex_session_index_line;
+#[cfg(test)]
+use crate::providers::codex::title::parse_codex_thread_title_json;
+use metrics::{apply_usage_limits, context_pct};
 use permission::{
     build_elicitation_options, build_permission_detail, build_permission_option_descriptions,
     build_permission_options, build_permission_prompt, permission_response,
     should_defer_codex_permission_to_auto_review,
 };
 
-const SUBAGENT_SESSION_RELATION: &str = "subagent-session";
 static NEXT_PENDING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-const MAX_HOOK_MESSAGE_BYTES: u64 = 1024 * 1024;
-const HOOK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_ELICITATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-#[derive(serde::Deserialize)]
-struct HookMessage {
-    agent: Option<String>,
-    agent_name: Option<String>,
-    event: Option<String>,
-    #[serde(default)]
-    data: serde_json::Value,
-    parent_pid: Option<u64>,
-    locus_app_instance: Option<String>,
-    locus_window_id: Option<String>,
-}
 
 struct ElicitationRequest {
     prompt: String,
@@ -55,246 +51,31 @@ struct ElicitationRequest {
     option_descriptions: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct SubagentInfo {
-    parent_session_id: String,
-    nickname: String,
-    role: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct LocusContext {
-    app_instance: Option<String>,
-    window_id: Option<String>,
-}
-
-impl LocusContext {
-    fn from_message(msg: &HookMessage) -> Self {
-        Self {
-            app_instance: non_empty_string(msg.locus_app_instance.as_deref()),
-            window_id: non_empty_string(msg.locus_window_id.as_deref()),
-        }
-    }
-
-    fn app_instance_for(&self, agent_name: &str, session_id: &str) -> Option<String> {
-        self.app_instance.clone().or_else(|| {
-            self.window_id.as_ref().map(|_| {
-                format!(
-                    "app-instance:{}",
-                    agent_session_node_key(agent_name, session_id)
-                )
-            })
-        })
-    }
-}
-
-fn non_empty_string(value: Option<&str>) -> Option<String> {
-    value
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-pub fn start_codex_compact_watcher(conn: zbus::Connection) {
-    let Some(path) = codex_log_file() else {
-        return;
-    };
-
-    tokio::spawn(async move {
-        let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        loop {
-            sleep(Duration::from_millis(500)).await;
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if metadata.len() < offset {
-                offset = 0;
-            }
-            if metadata.len() == offset {
-                continue;
-            }
-
-            let Ok(mut file) = std::fs::File::open(&path) else {
-                continue;
-            };
-            if file.seek(SeekFrom::Start(offset)).is_err() {
-                continue;
-            }
-            let mut chunk = String::new();
-            if file.read_to_string(&mut chunk).is_err() {
-                continue;
-            }
-            offset = metadata.len();
-
-            for line in chunk.lines() {
-                if let Some(event) = parse_codex_compact_log_line(line) {
-                    apply_codex_compact_log_event(&conn, event).await;
-                }
-            }
-        }
-    });
-}
-
-pub fn start_codex_parent_watcher(
-    conn: zbus::Connection,
-    ended: EndedSessions,
-    codex_session_parents: CodexSessionParents,
-) {
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(5)).await;
-            let watched: Vec<(String, u32)> = codex_session_parents
-                .lock()
-                .await
-                .iter()
-                .map(|(key, pid)| (key.clone(), *pid))
-                .collect();
-
-            for (key, parent_pid) in watched {
-                if process_exists(parent_pid) {
-                    continue;
-                }
-                let Some((agent_name, session_id)) = key.split_once(':') else {
-                    codex_session_parents.lock().await.remove(&key);
-                    continue;
-                };
-                let still_current =
-                    codex_session_parents.lock().await.get(&key).copied() == Some(parent_pid);
-                if still_current {
-                    remove_session(
-                        &conn,
-                        &ended,
-                        &codex_session_parents,
-                        agent_name,
-                        session_id,
-                    )
-                    .await;
-                    info!(
-                        session_id,
-                        parent_pid, "removed codex session after parent process exited"
-                    );
-                }
-            }
-        }
-    });
-}
-
-fn codex_log_file() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".codex/log/codex-tui.log"))
-}
-
-#[derive(Debug, PartialEq)]
-struct CodexCompactLogEvent {
-    session_id: String,
-    active: bool,
-}
-
-fn parse_codex_compact_log_line(line: &str) -> Option<CodexCompactLogEvent> {
-    if !line.contains("codex.op=\"compact\"") {
-        return None;
-    }
-
-    let active = if line.contains("codex_core::session::handlers: new") {
-        true
-    } else if line.contains("codex_core::session::handlers: close") {
-        false
-    } else {
-        return None;
-    };
-
-    Some(CodexCompactLogEvent {
-        session_id: parse_thread_id(line)?.to_string(),
-        active,
-    })
-}
-
-fn parse_thread_id(line: &str) -> Option<&str> {
-    let start = line.find("thread_id=")? + "thread_id=".len();
-    let rest = &line[start..];
-    let end = rest.find('}')?;
-    Some(&rest[..end])
-}
-
-async fn apply_codex_compact_log_event(conn: &zbus::Connection, event: CodexCompactLogEvent) {
-    log_zbus_result(
-        update_session(conn, "codex", &event.session_id, |d| {
-            if event.active {
-                d.state = SessionState::Compacting;
-                d.task_complete = false;
-                clear_pending_if_not_waiting(d);
-            } else if d.state == SessionState::Compacting {
-                d.state = SessionState::Idle;
-                d.task_complete = true;
-                clear_pending_if_not_waiting(d);
-            }
-        })
-        .await,
-        "update_session",
-        &event.session_id,
-    );
-}
-
 pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
     conn: zbus::Connection,
     ended: EndedSessions,
     codex_session_parents: CodexSessionParents,
 ) {
-    let mut buf = Vec::new();
-    let read_result = timeout(
-        HOOK_READ_TIMEOUT,
-        (&mut stream)
-            .take(MAX_HOOK_MESSAGE_BYTES + 1)
-            .read_to_end(&mut buf),
-    )
-    .await;
-    match read_result {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => {
-            warn!(%err, "failed to read hook message");
-            return;
-        }
-        Err(_) => {
-            warn!("timed out reading hook message");
-            return;
-        }
-    }
-    if buf.len() as u64 > MAX_HOOK_MESSAGE_BYTES {
-        warn!(bytes = buf.len(), "hook message exceeded maximum size");
+    let Some(hook) = read_raw_hook(&mut stream).await else {
         return;
-    }
-    let raw = match std::str::from_utf8(&buf) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return,
     };
-
-    let msg: HookMessage = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            info!("Failed to parse hook message: {}", e);
-            return;
-        }
-    };
-
-    let data = &msg.data;
-    let event = msg.event.clone().unwrap_or_default();
-    let agent_name = msg
-        .agent
-        .as_deref()
-        .or(msg.agent_name.as_deref())
-        .or_else(|| data["agent_name"].as_str())
-        .unwrap_or("agent")
-        .to_string();
-    let session_id = data["session_id"].as_str().unwrap_or("unknown").to_string();
-    let locus_context = LocusContext::from_message(&msg);
+    let data = &hook.data;
+    let event = hook.event.clone();
+    let agent_name = hook.agent.clone();
+    let session_id = hook.session_id.clone();
+    let app_instance_id = hook.app_instance_id.clone();
+    let window_id = hook.window_id.clone();
     info!(agent = %agent_name, event = %event, session_id = %session_id, "hook received");
     tracing::debug!(data = %data, "hook data");
+
+    refresh_session_title(&conn, &agent_name, &session_id, data).await;
 
     maybe_watch_codex_parent(
         &codex_session_parents,
         &agent_name,
         &session_id,
-        msg.parent_pid.and_then(|pid| u32::try_from(pid).ok()),
+        hook.parent_pid,
     )
     .await;
 
@@ -317,6 +98,12 @@ pub async fn handle_hook_connection(
             let cost_usd = data["cost"]["total_cost_usd"].as_f64().unwrap_or(0.0);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     if let Some(ctx_pct) = context_pct(data) {
                         d.context_pct = ctx_pct;
                     }
@@ -332,14 +119,6 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
-            publish_locus_agent_session_link(
-                &agent_name,
-                &session_id,
-                &locus_context,
-                data["cwd"].as_str(),
-                Some(&model),
-            )
-            .await;
         }
 
         "SessionStart" => {
@@ -352,6 +131,12 @@ pub async fn handle_hook_connection(
             );
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::Idle;
                     d.model_name = model.clone();
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
@@ -364,25 +149,6 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
-            if let Some(info) = subagent_info.as_ref() {
-                publish_locus_subagent_session_link(
-                    &agent_name,
-                    &session_id,
-                    info,
-                    data["cwd"].as_str(),
-                    false,
-                )
-                .await;
-            } else {
-                publish_locus_agent_session_link(
-                    &agent_name,
-                    &session_id,
-                    &locus_context,
-                    data["cwd"].as_str(),
-                    Some(&model),
-                )
-                .await;
-            }
         }
 
         "Stop" | "AfterAgent" => {
@@ -393,25 +159,6 @@ pub async fn handle_hook_connection(
                 subagent_parent_session_id(&conn, &agent_name, &session_id).await
             };
             if parent_session_id.is_some() {
-                let fallback_info;
-                let info = if let Some(info) = subagent_info.as_ref() {
-                    info
-                } else {
-                    fallback_info = SubagentInfo {
-                        parent_session_id: parent_session_id.unwrap_or_default(),
-                        nickname: String::new(),
-                        role: String::new(),
-                    };
-                    &fallback_info
-                };
-                publish_locus_subagent_session_link(
-                    &agent_name,
-                    &session_id,
-                    info,
-                    data["cwd"].as_str(),
-                    true,
-                )
-                .await;
                 remove_session(
                     &conn,
                     &ended,
@@ -426,6 +173,12 @@ pub async fn handle_hook_connection(
             let model = model_name(data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::Idle;
                     d.task_complete = true;
                     clear_pending_if_not_waiting(d);
@@ -437,18 +190,9 @@ pub async fn handle_hook_connection(
                 "update_session",
                 &session_id,
             );
-            publish_locus_agent_session_link(
-                &agent_name,
-                &session_id,
-                &locus_context,
-                data["cwd"].as_str(),
-                Some(&model),
-            )
-            .await;
         }
 
         "SessionEnd" => {
-            remove_locus_agent_session_link(&agent_name, &session_id, &locus_context).await;
             remove_session(
                 &conn,
                 &ended,
@@ -893,310 +637,6 @@ pub async fn handle_hook_connection(
     }
 }
 
-async fn maybe_watch_codex_parent(
-    codex_session_parents: &CodexSessionParents,
-    agent_name: &str,
-    session_id: &str,
-    parent_pid: Option<u32>,
-) {
-    if agent_name != "codex" || session_id == "unknown" {
-        return;
-    }
-
-    let Some(parent_pid) = parent_pid else {
-        return;
-    };
-
-    let key = session_key(agent_name, session_id);
-    let mut parents = codex_session_parents.lock().await;
-    if parents.get(&key) == Some(&parent_pid) {
-        return;
-    }
-    parents.insert(key.clone(), parent_pid);
-}
-
-async fn remove_session(
-    conn: &zbus::Connection,
-    ended: &EndedSessions,
-    codex_session_parents: &CodexSessionParents,
-    agent_name: &str,
-    session_id: &str,
-) {
-    let key = session_key(agent_name, session_id);
-    ended.lock().await.insert(key.clone());
-    codex_session_parents.lock().await.remove(&key);
-    remove_locus_agent_session_link(agent_name, session_id, &LocusContext::default()).await;
-    let path = session_path(agent_name, session_id);
-    if let Ok(iface_ref) = conn
-        .object_server()
-        .interface::<_, SessionObject>(&path)
-        .await
-    {
-        let cancelled = iface_ref.get_mut().await.cancel_pending_requests();
-        if cancelled > 0 {
-            info!(%session_id, cancelled, "cancelled pending requests for removed session");
-        }
-    }
-    match conn.object_server().remove::<SessionObject, _>(&path).await {
-        Ok(_) => {}
-        Err(err) => warn!(%err, %session_id, "failed to remove session object"),
-    }
-}
-
-async fn subagent_parent_session_id(
-    conn: &zbus::Connection,
-    agent_name: &str,
-    session_id: &str,
-) -> Option<String> {
-    let path = session_path(agent_name, session_id);
-    let Ok(iface_ref) = conn
-        .object_server()
-        .interface::<_, SessionObject>(&path)
-        .await
-    else {
-        return None;
-    };
-    let iface = iface_ref.get().await;
-    (iface.is_subagent && !iface.parent_session_id.is_empty())
-        .then(|| iface.parent_session_id.clone())
-}
-
-async fn publish_locus_agent_session_link(
-    agent_name: &str,
-    session_id: &str,
-    context: &LocusContext,
-    cwd: Option<&str>,
-    model: Option<&str>,
-) {
-    let Ok(connection) = zbus::Connection::session().await else {
-        return;
-    };
-    let Ok(locus_write) = GraphWriteProxy::new(&connection).await else {
-        return;
-    };
-
-    let target = format!(
-        "agent-session:{}",
-        agent_session_node_key(agent_name, session_id)
-    );
-    let _ = locus_write
-        .set_property(&target, "kind", "agent-session")
-        .await;
-    let _ = locus_write.set_property(&target, "id", session_id).await;
-    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
-        let _ = locus_write.set_property(&target, "cwd", cwd).await;
-    }
-    if let Some(model) = model.filter(|model| !model.is_empty() && *model != "unknown") {
-        let _ = locus_write.set_property(&target, "model", model).await;
-    }
-    publish_session_project(&locus_write, &target, cwd).await;
-
-    let Some(app_instance) = context.app_instance_for(agent_name, session_id) else {
-        return;
-    };
-    if let Some(window_id) = context.window_id.as_deref() {
-        let window = format!("window:{window_id}");
-        let _ = locus_write
-            .set_property(&app_instance, "kind", "app-instance")
-            .await;
-        let _ = locus_write
-            .set_property(&app_instance, "name", agent_name)
-            .await;
-        let _ = locus_write
-            .set_property(&app_instance, "icon", &safe_path_segment(agent_name))
-            .await;
-        let _ = locus_write
-            .set_link(&window, "app-instance", &app_instance)
-            .await;
-    }
-    let _ = locus_write
-        .set_link(&app_instance, "agent-session", &target)
-        .await;
-}
-
-async fn remove_locus_agent_session_link(
-    agent_name: &str,
-    session_id: &str,
-    context: &LocusContext,
-) {
-    let Ok(connection) = zbus::Connection::session().await else {
-        return;
-    };
-    let Ok(locus_write) = GraphWriteProxy::new(&connection).await else {
-        return;
-    };
-    let Ok(locus_read) = GraphReadProxy::new(&connection).await else {
-        return;
-    };
-
-    let target = format!(
-        "agent-session:{}",
-        agent_session_node_key(agent_name, session_id)
-    );
-    remove_existing_top_level_session_links(&locus_write, &locus_read, &target).await;
-    let _ = locus_write.remove_links(&target, "session-project").await;
-    if let Some(app_instance) = context.app_instance_for(agent_name, session_id)
-        && let Some(window_id) = context.window_id.as_deref()
-    {
-        let window = format!("window:{window_id}");
-        let _ = locus_write
-            .remove_link(&window, "app-instance", &app_instance)
-            .await;
-    }
-    let _ = locus_write.delete_node(&target).await;
-}
-
-async fn remove_existing_top_level_session_links(
-    locus: &GraphWriteProxy<'_>,
-    locus_read: &GraphReadProxy<'_>,
-    target: &str,
-) {
-    for app_instance in locus_read
-        .get_sources(target, "agent-session")
-        .await
-        .unwrap_or_default()
-    {
-        let _ = locus
-            .remove_link(&app_instance, "agent-session", target)
-            .await;
-    }
-}
-
-async fn publish_session_project(locus: &GraphWriteProxy<'_>, session: &str, cwd: Option<&str>) {
-    let Some(project) = cwd.and_then(project_for_cwd) else {
-        return;
-    };
-    let subject = format!("project:{}", project.root.display());
-
-    let _ = locus.set_property(&subject, "kind", "project").await;
-    let _ = locus
-        .set_property(&subject, "path", &project.root.display().to_string())
-        .await;
-    let _ = locus.set_property(&subject, "name", &project.name).await;
-    if let Some(icon) = project.icon.as_deref().filter(|icon| !icon.is_empty()) {
-        let _ = locus.set_property(&subject, "icon", icon).await;
-    }
-    let _ = locus.set_link(session, "session-project", &subject).await;
-}
-
-struct Project {
-    root: PathBuf,
-    name: String,
-    icon: Option<String>,
-}
-
-fn project_for_cwd(cwd: &str) -> Option<Project> {
-    let cwd = std::fs::canonicalize(cwd).ok()?;
-    let parent = project_parent()?;
-    let relative = cwd.strip_prefix(&parent).ok()?;
-    let project_name = relative.components().next()?.as_os_str().to_str()?;
-    if project_name.is_empty() {
-        return None;
-    }
-
-    let root = parent.join(project_name);
-    let metadata = read_project_metadata(&root);
-    Some(Project {
-        root,
-        name: metadata
-            .as_ref()
-            .and_then(|value| json_string(value, "name"))
-            .unwrap_or_else(|| project_name.to_string()),
-        icon: metadata
-            .as_ref()
-            .and_then(|value| json_string(value, "icon")),
-    })
-}
-
-fn project_parent() -> Option<PathBuf> {
-    let parent = std::env::var_os("PROJECT_PARENT")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join("proj")))?;
-    std::fs::canonicalize(parent).ok()
-}
-
-fn read_project_metadata(root: &Path) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(root.join(".project.json")).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
-    value.get(key)?.as_str().map(str::to_string)
-}
-
-async fn publish_locus_subagent_session_link(
-    agent_name: &str,
-    session_id: &str,
-    info: &SubagentInfo,
-    cwd: Option<&str>,
-    remove: bool,
-) {
-    let Ok(connection) = zbus::Connection::session().await else {
-        return;
-    };
-    let Ok(locus_write) = GraphWriteProxy::new(&connection).await else {
-        return;
-    };
-    let Ok(locus_read) = GraphReadProxy::new(&connection).await else {
-        return;
-    };
-
-    let target = format!(
-        "agent-session:{}",
-        agent_session_node_key(agent_name, session_id)
-    );
-    let parent = format!(
-        "agent-session:{}",
-        agent_session_node_key(agent_name, &info.parent_session_id)
-    );
-
-    for app_instance in locus_read
-        .get_sources(&target, "agent-session")
-        .await
-        .unwrap_or_default()
-    {
-        let _ = locus_write
-            .remove_link(&app_instance, "agent-session", &target)
-            .await;
-    }
-
-    if remove {
-        let _ = locus_write
-            .remove_link(&parent, SUBAGENT_SESSION_RELATION, &target)
-            .await;
-        let _ = locus_write.remove_links(&target, "session-project").await;
-        return;
-    }
-
-    let _ = locus_write
-        .set_property(&target, "kind", "agent-session")
-        .await;
-    let _ = locus_write.set_property(&target, "id", session_id).await;
-    if let Some(cwd) = cwd {
-        let _ = locus_write.set_property(&target, "cwd", cwd).await;
-    }
-    let _ = locus_write
-        .set_property(&parent, "kind", "agent-session")
-        .await;
-    let _ = locus_write
-        .set_property(&parent, "id", &info.parent_session_id)
-        .await;
-    let _ = locus_write
-        .set_link(&parent, SUBAGENT_SESSION_RELATION, &target)
-        .await;
-    let _ = locus_write.remove_links(&target, "session-project").await;
-}
-
-fn process_exists(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
-}
-
-fn log_zbus_result(result: zbus::Result<()>, action: &str, session_id: &str) {
-    if let Err(err) = result {
-        warn!(%err, %session_id, action, "D-Bus operation failed");
-    }
-}
-
 async fn apply_attention_event(
     conn: &zbus::Connection,
     agent_name: &str,
@@ -1240,6 +680,48 @@ async fn clear_attention_event(
     );
 }
 
+async fn refresh_session_title(
+    conn: &zbus::Connection,
+    agent_name: &str,
+    session_id: &str,
+    data: &serde_json::Value,
+) {
+    let Some(title) = session_title(agent_name, session_id, data) else {
+        return;
+    };
+    if title.is_empty() {
+        return;
+    }
+    log_zbus_result(
+        update_session(conn, agent_name, session_id, |d| {
+            d.session_title = title;
+        })
+        .await,
+        "update_session",
+        session_id,
+    );
+}
+
+fn session_title(agent_name: &str, session_id: &str, data: &serde_json::Value) -> Option<String> {
+    hook_session_title(data).or_else(|| {
+        (agent_name == "codex")
+            .then(|| codex_thread_title(session_id))
+            .flatten()
+    })
+}
+
+fn hook_session_title(data: &serde_json::Value) -> Option<String> {
+    let paths: &[&[&str]] = &[
+        &["session_title"],
+        &["thread_name"],
+        &["title"],
+        &["payload", "session_title"],
+        &["payload", "thread_name"],
+        &["payload", "title"],
+    ];
+    json_string_at_any(data, paths).filter(|title| !title.is_empty())
+}
+
 fn model_name(data: &serde_json::Value) -> String {
     data["model"]["display_name"]
         .as_str()
@@ -1259,97 +741,19 @@ fn apply_subagent_info(session: &mut SessionObject, info: Option<&SubagentInfo>)
     session.agent_role = info.role.clone();
 }
 
-fn codex_subagent_info(
-    agent_name: &str,
+fn apply_transport_metadata(
+    session: &mut SessionObject,
     session_id: &str,
-    data: &serde_json::Value,
-) -> Option<SubagentInfo> {
-    if agent_name != "codex" {
-        return None;
+    app_instance_id: Option<&str>,
+    window_id: Option<&str>,
+) {
+    session.session_id = session_id.to_string();
+    if let Some(app_instance_id) = app_instance_id {
+        session.app_instance_id = app_instance_id.to_string();
     }
-
-    subagent_info_from_value(data)
-        .or_else(|| codex_session_meta_from_hook(data))
-        .or_else(|| {
-            codex_session_file(session_id).and_then(|path| codex_session_meta_from_path(&path))
-        })
-        .and_then(|meta| {
-            if meta.parent_session_id.is_empty() {
-                None
-            } else {
-                Some(meta)
-            }
-        })
-}
-
-fn subagent_info_from_value(value: &serde_json::Value) -> Option<SubagentInfo> {
-    let thread_source = json_string_at(value, &["thread_source"])
-        .or_else(|| json_string_at(value, &["payload", "thread_source"]));
-    let explicit_subagent = thread_source.as_deref() == Some("subagent")
-        || value
-            .pointer("/source/subagent/thread_spawn")
-            .is_some_and(serde_json::Value::is_object)
-        || value
-            .pointer("/payload/source/subagent/thread_spawn")
-            .is_some_and(serde_json::Value::is_object);
-
-    let parent_session_id = json_string_at(
-        value,
-        &["source", "subagent", "thread_spawn", "parent_thread_id"],
-    )
-    .or_else(|| {
-        json_string_at(
-            value,
-            &[
-                "payload",
-                "source",
-                "subagent",
-                "thread_spawn",
-                "parent_thread_id",
-            ],
-        )
-    })
-    .or_else(|| json_string_at(value, &["thread_spawn", "parent_thread_id"]))
-    .or_else(|| json_string_at(value, &["parent_thread_id"]))
-    .unwrap_or_default();
-
-    if !explicit_subagent && parent_session_id.is_empty() {
-        return None;
+    if let Some(window_id) = window_id {
+        session.window_id = window_id.to_string();
     }
-
-    Some(SubagentInfo {
-        parent_session_id,
-        nickname: json_string_at(value, &["agent_nickname"])
-            .or_else(|| json_string_at(value, &["payload", "agent_nickname"]))
-            .unwrap_or_default(),
-        role: json_string_at(value, &["agent_role"])
-            .or_else(|| json_string_at(value, &["payload", "agent_role"]))
-            .unwrap_or_default(),
-    })
-}
-
-fn codex_session_meta_from_hook(data: &serde_json::Value) -> Option<SubagentInfo> {
-    let path = data["transcript_path"]
-        .as_str()
-        .or_else(|| data["session_path"].as_str())
-        .or_else(|| data["session_file"].as_str())?;
-    codex_session_meta_from_path(Path::new(path))
-}
-
-fn codex_session_meta_from_path(path: &Path) -> Option<SubagentInfo> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut contents = String::new();
-    (&mut file)
-        .take(256 * 1024)
-        .read_to_string(&mut contents)
-        .ok()?;
-    contents.lines().find_map(|line| {
-        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
-        if entry["type"].as_str()? != "session_meta" {
-            return None;
-        }
-        subagent_info_from_value(&entry["payload"])
-    })
 }
 
 fn json_string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
@@ -1358,6 +762,10 @@ fn json_string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
         current = current.get(*segment)?;
     }
     current.as_str().map(str::to_string)
+}
+
+fn json_string_at_any(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| json_string_at(value, path))
 }
 
 async fn handle_elicitation_event(
@@ -1372,7 +780,7 @@ async fn handle_elicitation_event(
     let path = session_path(agent_name, session_id);
     if let Err(err) = conn
         .object_server()
-        .at(&path, SessionObject::new(agent_name))
+        .at(&path, SessionObject::new(agent_name, session_id))
         .await
     {
         warn!(%err, %session_id, "failed to ensure session object for elicitation");
@@ -1388,6 +796,7 @@ async fn handle_elicitation_event(
 
     let (tx, rx) = oneshot::channel();
     let request_id = next_pending_request_id();
+    global_request_broker().register(request_id.clone(), tx);
     {
         let mut iface = iface_ref.get_mut().await;
         if !iface.push_pending_request(PendingRequest {
@@ -1397,8 +806,8 @@ async fn handle_elicitation_event(
             detail_text: request.detail_text,
             options: request.options.clone(),
             option_descriptions: request.option_descriptions.clone(),
-            tx,
         }) {
+            global_request_broker().remove(&request_id);
             warn!(
                 agent = %agent_name,
                 session_id = %session_id,
@@ -1472,6 +881,7 @@ async fn handle_elicitation_event(
     {
         let mut iface = iface_ref.get_mut().await;
         iface.remove_pending_request(&request_id);
+        global_request_broker().remove(&request_id);
     }
     let iface = iface_ref.get().await;
     if let Err(err) = iface.emit_pending_changed(emitter).await {
@@ -1546,6 +956,38 @@ fn next_pending_request_id() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn codex_thread_title_json_preserves_multiline_title() {
+        let output = r#"[{"title":"first line\nsecond line"}]"#;
+
+        assert_eq!(
+            parse_codex_thread_title_json(output),
+            Some("first line\nsecond line".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_session_index_line_parses_thread_name() {
+        let line =
+            r#"{"id":"session-1","thread_name":"ags agent","updated_at":"2026-06-06T01:02:13Z"}"#;
+
+        assert_eq!(
+            parse_codex_session_index_line(line),
+            Some(("session-1".to_string(), "ags agent".to_string()))
+        );
+    }
+
+    #[test]
+    fn hook_session_title_accepts_nested_payload_name() {
+        let data = json!({
+            "payload": {
+                "thread_name": "manual title"
+            }
+        });
+
+        assert_eq!(hook_session_title(&data), Some("manual title".to_string()));
+    }
 
     #[test]
     fn elicitation_options_include_always_allow_when_persisted_approval_is_supported() {
@@ -1994,7 +1436,7 @@ mod tests {
 
     #[test]
     fn request_user_input_attention_sets_and_clears_without_pending_requests() {
-        let mut session = SessionObject::new("codex");
+        let mut session = SessionObject::new("codex", "session-1");
         let data = json!({
             "session_id": "session-1",
             "cwd": "/tmp/project",
@@ -2025,7 +1467,7 @@ mod tests {
 
     #[test]
     fn nonblocking_attention_tracks_independent_reasons() {
-        let mut session = SessionObject::new("codex");
+        let mut session = SessionObject::new("codex", "session-1");
         let data = json!({
             "session_id": "session-1",
             "cwd": "/tmp/project",
@@ -2060,7 +1502,7 @@ mod tests {
 
     #[test]
     fn plan_mode_prompt_attention_marks_turn_complete_idle() {
-        let mut session = SessionObject::new("codex");
+        let mut session = SessionObject::new("codex", "session-1");
         let data = json!({
             "session_id": "session-1",
             "cwd": "/tmp/project",

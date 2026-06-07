@@ -1,5 +1,5 @@
-use agent_dbus::constants::{BUS_NAME, SESSION_INTERFACE};
-use agent_dbus::path::session_path;
+use agent_dbus_core::constants::{BUS_NAME, SESSION_INTERFACE};
+use agent_dbus_core::path::session_path;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

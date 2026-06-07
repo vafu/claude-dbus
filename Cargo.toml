@@ -1,25 +1,16 @@
-[package]
-name = "agent-dbus"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "agent-dbus-core",
+    "agent-dbus-service",
+    "agent-dbus-locus-proxy",
+]
+resolver = "3"
 
-[[bin]]
-name = "agent-dbus"
-path = "src/main.rs"
-
-[[bin]]
-name = "agent-hook"
-path = "src/agent_hook.rs"
-
-[[bin]]
-name = "agent-respond"
-path = "src/agent_respond.rs"
-
-[dependencies]
-locus = { package = "locus-dbus", path = "../locus/locus-dbus" }
-zbus = "5.0"
-serde_json = "1.0"
+[workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = "5.0"
+locus = { package = "locus-dbus", path = "../locus/locus-dbus" }

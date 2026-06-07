@@ -4,17 +4,23 @@ A Rust D-Bus service that bridges lifecycle hooks from agentic coding tools to a
 
 ## Project Structure
 
-- `src/main.rs` - startup, D-Bus server setup, Unix socket accept loop
-- `src/types.rs` - `SessionState` enum
-- `src/dbus.rs` - `SessionObject` D-Bus interface, properties, signals, and update helper
-- `src/hooks.rs` - hook event handling and approval/input helpers
-- `src/agent_hook.rs` - CLI binary used as the command hook for all supported agents
+- `agent-dbus-core` - shared constants, path helpers, and provider trait/types
+- `agent-dbus-service/src/main.rs` - startup, D-Bus server setup, Unix socket accept loop
+- `agent-dbus-service/src/dbus.rs` - `SessionObject` D-Bus interface, properties, methods, and signals
+- `agent-dbus-service/src/service.rs` - hook event dispatch and approval/input flow
+- `agent-dbus-service/src/socket.rs` - Unix socket hook message parsing
+- `agent-dbus-service/src/session_store.rs` - D-Bus session create/update/remove facade
+- `agent-dbus-service/src/request_broker.rs` - pending response channel bookkeeping
+- `agent-dbus-service/src/providers` - provider-specific Codex/Gemini helpers and side-channel watchers
+- `agent-dbus-service/src/agent_hook.rs` - CLI binary used as the command hook for all supported agents
+- `agent-dbus-locus-proxy` - optional D-Bus-to-Locus metadata mirror
 
 ## Binaries
 
 - `agent-dbus` - the long-running D-Bus service
 - `agent-hook` - called by agent hooks; wraps stdin JSON and sends it to the Unix socket
 - `agent-respond` - terminal helper for answering a pending request
+- `agent-dbus-locus-proxy` - optional proxy that mirrors active D-Bus sessions into Locus
 
 ## Architecture
 
@@ -147,4 +153,4 @@ The bridge returns the shared `hookSpecificOutput` wrapper used by current Claud
 
 ### Keeping README in sync
 
-When changing properties, methods, signals, bus name, object path, or interface name in `src/dbus.rs`, update the D-Bus Interface section in `README.md`.
+When changing properties, methods, signals, bus name, object path, or interface name in `agent-dbus-service/src/dbus.rs`, update the D-Bus Interface section in `README.md`.
