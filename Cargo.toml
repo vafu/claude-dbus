@@ -2,7 +2,7 @@
 members = [
     "agent-dbus-core",
     "agent-dbus-service",
-    "agent-dbus-locus-proxy",
+    "agent-dbus-locusfs-proxy",
 ]
 resolver = "3"
 
@@ -13,4 +13,3 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "io-util", "
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = "5.0"
-locus = { package = "locus-dbus", path = "../locus/locus-dbus" }

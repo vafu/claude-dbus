@@ -21,7 +21,7 @@ agent-dbus                       (long-running service)
       +-- Codex compact state watcher -> tails ~/.codex/log/codex-tui.log
       |
       v optional
-agent-dbus-locus-proxy           (mirrors D-Bus sessions into Locus metadata)
+agent-dbus-locusfs-proxy         (mirrors D-Bus sessions into locusfs nodes/symlinks)
 ```
 
 The service stores sessions under both agent name and session id, so `claude`, `codex`, and `gemini` sessions can run at the same time without object-path collisions.
@@ -41,7 +41,7 @@ Codex also does not expose a compact lifecycle hook. To surface `compacting` sta
 ```bash
 cargo build --release
 cargo install --release --path agent-dbus-service
-cargo install --release --path agent-dbus-locus-proxy
+cargo install --release --path agent-dbus-locusfs-proxy
 ```
 
 This installs:
@@ -49,7 +49,7 @@ This installs:
 - `agent-dbus` - the long-running D-Bus service
 - `agent-hook` - the command invoked by agent hooks
 - `agent-respond` - a terminal helper for answering pending requests
-- `agent-dbus-locus-proxy` - optional D-Bus-to-Locus metadata mirror
+- `agent-dbus-locusfs-proxy` - optional D-Bus-to-locusfs node/symlink mirror
 
 ## Start The Service
 
@@ -79,9 +79,20 @@ Or run it in a terminal:
 agent-dbus
 ```
 
-## Locus Proxy
+## locusfs Symlink Mirror
 
-`agent-dbus` does not write Locus directly. Run `agent-dbus-locus-proxy` if you want active D-Bus sessions mirrored into Locus as `agent-session:<agent>/<session-id>` nodes with window/app/project/subagent links.
+`agent-dbus` does not write locusfs directly. Run `agent-dbus-locusfs-proxy` if you want active D-Bus sessions mirrored into locusfs as `agent-session:<agent>/<session-id>` nodes with window/app/project/subagent links.
+
+The mirror writes through the locusfs filesystem surface. It creates node
+directories, property files, and relation symlinks under `$LOCUS_ROOT`,
+falling back to `$LOCUSFS_ROOT`, `$LOCUS_MOUNT`, or `/tmp/locusfs` when unset.
+For example:
+
+```text
+/window/<window-id>/app-instance -> /app-instance/<app-instance-id>
+/app-instance/<app-instance-id>/agent-session -> /agent-session/<agent>/<session-id>
+/agent-session/<agent>/<session-id>/session-project -> /project/<project-root>
+```
 
 ## Hook CLI
 

@@ -1,15 +1,14 @@
 [package]
-name = "agent-dbus-locus-proxy"
+name = "agent-dbus-locusfs-proxy"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "agent-dbus-locus-proxy"
+name = "agent-dbus-locusfs-proxy"
 path = "src/main.rs"
 
 [dependencies]
 agent-dbus-core = { path = "../agent-dbus-core" }
-locus = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

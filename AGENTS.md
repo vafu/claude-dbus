@@ -13,14 +13,14 @@ A Rust D-Bus service that bridges lifecycle hooks from agentic coding tools to a
 - `agent-dbus-service/src/request_broker.rs` - pending response channel bookkeeping
 - `agent-dbus-service/src/providers` - provider-specific Codex/Gemini helpers and side-channel watchers
 - `agent-dbus-service/src/agent_hook.rs` - CLI binary used as the command hook for all supported agents
-- `agent-dbus-locus-proxy` - optional D-Bus-to-Locus metadata mirror
+- `agent-dbus-locusfs-proxy` - optional D-Bus-to-locusfs symlink mirror
 
 ## Binaries
 
 - `agent-dbus` - the long-running D-Bus service
 - `agent-hook` - called by agent hooks; wraps stdin JSON and sends it to the Unix socket
 - `agent-respond` - terminal helper for answering a pending request
-- `agent-dbus-locus-proxy` - optional proxy that mirrors active D-Bus sessions into Locus
+- `agent-dbus-locusfs-proxy` - optional mirror that writes active D-Bus sessions into locusfs as nodes, properties, and symlink relations
 
 ## Architecture
 
