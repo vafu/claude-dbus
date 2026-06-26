@@ -111,7 +111,9 @@ pub async fn handle_hook_connection(
                     d.cwd = cwd.clone();
                     d.cost_usd = cost_usd;
                     apply_usage_limits(d, &agent_name, &session_id, data);
-                    if d.state == SessionState::NoSession {
+                    if let Some(state) = hook_state(data) {
+                        d.state = state;
+                    } else if d.state == SessionState::NoSession {
                         d.state = SessionState::Idle;
                     }
                 })
@@ -206,6 +208,12 @@ pub async fn handle_hook_connection(
         "TaskCompleted" => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.task_complete = true;
                 })
                 .await,
@@ -218,6 +226,12 @@ pub async fn handle_hook_connection(
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::Thinking;
                     d.task_complete = false;
                     clear_pending_if_not_waiting(d);
@@ -235,6 +249,12 @@ pub async fn handle_hook_connection(
         "AfterModel" => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::Thinking;
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
@@ -249,6 +269,12 @@ pub async fn handle_hook_connection(
         "BeforeTool" if is_gemini_agent(&agent_name) => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::ToolUse;
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
@@ -287,6 +313,12 @@ pub async fn handle_hook_connection(
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::ToolUse;
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
@@ -303,6 +335,12 @@ pub async fn handle_hook_connection(
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::Thinking;
                     clear_transient_attention(d);
                     d.model_name = model_name(data);
@@ -336,6 +374,12 @@ pub async fn handle_hook_connection(
         "PreCompact" | "PreCompress" => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.state = SessionState::Compacting;
                     clear_pending_if_not_waiting(d);
                 })
@@ -348,6 +392,12 @@ pub async fn handle_hook_connection(
         "PermissionRequest" => {
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -768,6 +818,18 @@ fn json_string_at_any(value: &serde_json::Value, paths: &[&[&str]]) -> Option<St
     paths.iter().find_map(|path| json_string_at(value, path))
 }
 
+fn hook_state(data: &serde_json::Value) -> Option<SessionState> {
+    let paths: &[&[&str]] = &[
+        &["state"],
+        &["status"],
+        &["session", "state"],
+        &["session", "status"],
+        &["payload", "state"],
+        &["payload", "status"],
+    ];
+    json_string_at_any(data, paths).and_then(|state| parse_session_state(&state))
+}
+
 async fn handle_elicitation_event(
     conn: &zbus::Connection,
     agent_name: &str,
@@ -935,12 +997,16 @@ fn attention_reason(data: &serde_json::Value) -> String {
 }
 
 fn attention_state(data: &serde_json::Value) -> Option<SessionState> {
-    match data["state"].as_str()? {
+    data["state"].as_str().and_then(parse_session_state)
+}
+
+fn parse_session_state(state: &str) -> Option<SessionState> {
+    match state.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "no-session" => Some(SessionState::NoSession),
-        "idle" => Some(SessionState::Idle),
-        "thinking" => Some(SessionState::Thinking),
-        "tool-use" => Some(SessionState::ToolUse),
-        "compacting" => Some(SessionState::Compacting),
+        "idle" | "stopped" | "complete" | "completed" | "done" => Some(SessionState::Idle),
+        "thinking" | "working" | "running" | "busy" => Some(SessionState::Thinking),
+        "tool-use" | "tool" | "tooluse" => Some(SessionState::ToolUse),
+        "compacting" | "compact" | "compressing" | "compress" => Some(SessionState::Compacting),
         _ => None,
     }
 }
@@ -1347,6 +1413,27 @@ mod tests {
             })),
             Some(40.0)
         );
+    }
+
+    #[test]
+    fn hook_state_accepts_status_line_shapes() {
+        assert!(matches!(
+            hook_state(&json!({ "state": "idle" })),
+            Some(SessionState::Idle)
+        ));
+        assert!(matches!(
+            hook_state(&json!({ "status": "busy" })),
+            Some(SessionState::Thinking)
+        ));
+        assert!(matches!(
+            hook_state(&json!({ "session": { "state": "tool_use" } })),
+            Some(SessionState::ToolUse)
+        ));
+        assert!(matches!(
+            hook_state(&json!({ "payload": { "status": "compacting" } })),
+            Some(SessionState::Compacting)
+        ));
+        assert!(hook_state(&json!({ "status": "unknown" })).is_none());
     }
 
     #[test]
