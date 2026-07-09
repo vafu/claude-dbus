@@ -685,6 +685,16 @@ pub async fn handle_hook_connection(
             info!("Unknown hook event: {}", other);
         }
     }
+
+    if event != "SessionEnd" {
+        crate::locus::link_session(
+            &agent_name,
+            &session_id,
+            app_instance_id.as_deref(),
+            window_id.as_deref(),
+        )
+        .await;
+    }
 }
 
 async fn apply_attention_event(

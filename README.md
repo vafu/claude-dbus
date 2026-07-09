@@ -17,10 +17,11 @@ agent-dbus                       (long-running service)
       |
       +-- per-session D-Bus objects with properties
       +-- ObjectManager signals for session lifecycle
+      +-- best-effort Locus DBus relations for window/app-instance -> agent-session
       +-- blocking approval/input requests -> waits for RespondToElicitation or RespondToElicitationById
       +-- Codex compact state watcher -> tails ~/.codex/log/codex-tui.log
       |
-      v optional
+      v legacy optional
 agent-dbus-locusfs-proxy         (mirrors D-Bus sessions into locusfs nodes/symlinks)
 ```
 
@@ -79,9 +80,26 @@ Or run it in a terminal:
 agent-dbus
 ```
 
-## locusfs Symlink Mirror
+## Locus Relations
 
-`agent-dbus` does not write locusfs directly. Run `agent-dbus-locusfs-proxy` if you want active D-Bus sessions mirrored into locusfs as `agent-session:<agent>/<session-id>` nodes with window/app/project/subagent links.
+When hook metadata includes `window_id` or `app_instance_id`, `agent-dbus`
+publishes best-effort relations to the Locus D-Bus service at
+`org.rsynapse.Locus`:
+
+```text
+niri-window:<window-id> --org.rsynapse.window.agent-session--> agent-session:<agent>/<session-id>
+app-instance:<app-instance-id> --org.rsynapse.app-instance.agent-session--> agent-session:<agent>/<session-id>
+```
+
+Relations use `SetOne`, so one window or app instance points at one current
+agent session for that relation. Normal session removal unsets the matching
+relations when the stored `WindowId` or `AppInstanceId` is available.
+
+## Legacy locusfs Symlink Mirror
+
+Run `agent-dbus-locusfs-proxy` only if you still want active D-Bus sessions
+mirrored into locusfs as `agent-session:<agent>/<session-id>` nodes with
+window/app/project/subagent links.
 
 The mirror writes through the locusfs filesystem surface. It creates node
 directories, property files, and relation symlinks under `$LOCUS_ROOT`,

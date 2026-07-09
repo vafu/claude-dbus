@@ -11,6 +11,7 @@ use zbus::connection;
 use agent_dbus_core::constants::{BUS_NAME, ROOT_PATH, socket_path};
 
 mod dbus;
+mod locus;
 mod providers;
 mod request_broker;
 mod service;

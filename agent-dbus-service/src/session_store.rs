@@ -46,20 +46,37 @@ pub(crate) async fn remove_session(
     ended.lock().await.insert(key.clone());
     codex_session_parents.lock().await.remove(&key);
     let path = session_path(agent_name, session_id);
+    let mut app_instance_id = None;
+    let mut window_id = None;
     if let Ok(iface_ref) = conn
         .object_server()
         .interface::<_, SessionObject>(&path)
         .await
     {
-        let cancelled = iface_ref.get_mut().await.cancel_pending_requests();
+        let mut iface = iface_ref.get_mut().await;
+        app_instance_id = non_empty(&iface.app_instance_id).map(str::to_owned);
+        window_id = non_empty(&iface.window_id).map(str::to_owned);
+        let cancelled = iface.cancel_pending_requests();
         if cancelled > 0 {
             debug!(%session_id, cancelled, "cancelled pending requests for removed session");
         }
     }
+    crate::locus::unlink_session(
+        agent_name,
+        session_id,
+        app_instance_id.as_deref(),
+        window_id.as_deref(),
+    )
+    .await;
     match conn.object_server().remove::<SessionObject, _>(&path).await {
         Ok(_) => {}
         Err(err) => warn!(%err, %session_id, "failed to remove session object"),
     }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 pub(crate) async fn subagent_parent_session_id(
