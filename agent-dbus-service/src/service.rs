@@ -116,6 +116,7 @@ pub async fn handle_hook_connection(
                     } else if d.state == SessionState::NoSession {
                         d.state = SessionState::Idle;
                     }
+                    apply_hook_task_complete(d, data);
                 })
                 .await,
                 "update_session",
@@ -181,8 +182,7 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::Idle;
-                    d.task_complete = true;
+                    mark_turn_complete(d);
                     clear_pending_if_not_waiting(d);
                     d.model_name = model.clone();
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
@@ -214,7 +214,8 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.task_complete = true;
+                    mark_turn_complete(d);
+                    clear_pending_if_not_waiting(d);
                 })
                 .await,
                 "update_session",
@@ -828,6 +829,18 @@ fn json_string_at_any(value: &serde_json::Value, paths: &[&[&str]]) -> Option<St
     paths.iter().find_map(|path| json_string_at(value, path))
 }
 
+fn json_bool_at(value: &serde_json::Value, path: &[&str]) -> Option<bool> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current.as_bool()
+}
+
+fn json_bool_at_any(value: &serde_json::Value, paths: &[&[&str]]) -> Option<bool> {
+    paths.iter().find_map(|path| json_bool_at(value, path))
+}
+
 fn hook_state(data: &serde_json::Value) -> Option<SessionState> {
     let paths: &[&[&str]] = &[
         &["state"],
@@ -838,6 +851,31 @@ fn hook_state(data: &serde_json::Value) -> Option<SessionState> {
         &["payload", "status"],
     ];
     json_string_at_any(data, paths).and_then(|state| parse_session_state(&state))
+}
+
+fn hook_task_complete(data: &serde_json::Value) -> Option<bool> {
+    let paths: &[&[&str]] = &[
+        &["task_complete"],
+        &["taskComplete"],
+        &["session", "task_complete"],
+        &["session", "taskComplete"],
+        &["payload", "task_complete"],
+        &["payload", "taskComplete"],
+    ];
+    json_bool_at_any(data, paths)
+}
+
+fn apply_hook_task_complete(session: &mut SessionObject, data: &serde_json::Value) {
+    match hook_task_complete(data) {
+        Some(true) => mark_turn_complete(session),
+        Some(false) => session.task_complete = false,
+        None => {}
+    }
+}
+
+fn mark_turn_complete(session: &mut SessionObject) {
+    session.state = SessionState::Idle;
+    session.task_complete = true;
 }
 
 async fn handle_elicitation_event(
@@ -1444,6 +1482,41 @@ mod tests {
             Some(SessionState::Compacting)
         ));
         assert!(hook_state(&json!({ "status": "unknown" })).is_none());
+    }
+
+    #[test]
+    fn hook_task_complete_accepts_direct_and_nested_shapes() {
+        assert_eq!(
+            hook_task_complete(&json!({ "task_complete": true })),
+            Some(true)
+        );
+        assert_eq!(
+            hook_task_complete(&json!({ "session": { "taskComplete": false } })),
+            Some(false)
+        );
+        assert_eq!(
+            hook_task_complete(&json!({ "payload": { "task_complete": true } })),
+            Some(true)
+        );
+        assert_eq!(
+            hook_task_complete(&json!({ "task_complete": "true" })),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_hook_marks_session_idle() {
+        let mut session = SessionObject::new("codex", "session-1");
+        session.state = SessionState::Thinking;
+        session.task_complete = false;
+
+        apply_hook_task_complete(
+            &mut session,
+            &json!({ "payload": { "taskComplete": true } }),
+        );
+
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.task_complete);
     }
 
     #[test]

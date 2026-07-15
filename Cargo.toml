@@ -2,7 +2,6 @@
 members = [
     "agent-dbus-core",
     "agent-dbus-service",
-    "agent-dbus-locusfs-proxy",
 ]
 resolver = "3"
 

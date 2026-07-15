@@ -9,6 +9,11 @@ const LOCUS_PATH: &str = "/org/rsynapse/Locus";
 const LOCUS_INTERFACE: &str = "org.rsynapse.Locus.Relations1";
 const WINDOW_AGENT_RELATION: &str = "org.rsynapse.window.agent-session";
 const APP_INSTANCE_AGENT_RELATION: &str = "org.rsynapse.app-instance.agent-session";
+const AGENT_SESSION_KIND: &str = "org.rsynapse.agent.session.id";
+const APP_INSTANCE_KIND: &str = "org.rsynapse.app-instance.id";
+const NIRI_WINDOW_KIND: &str = "org.rsynapse.niri.window.id";
+
+type RelationEndpoint = HashMap<String, String>;
 
 pub(crate) async fn link_session(
     agent_name: &str,
@@ -94,9 +99,9 @@ async fn locus_proxy(connection: &zbus::Connection) -> zbus::Result<Proxy<'_>> {
 
 async fn set_one(
     proxy: &Proxy<'_>,
-    subject: &str,
+    subject: &RelationEndpoint,
     relation: &str,
-    target: &str,
+    target: &RelationEndpoint,
     metadata: &HashMap<String, String>,
 ) -> zbus::Result<()> {
     proxy
@@ -105,7 +110,12 @@ async fn set_one(
         .map(|_| ())
 }
 
-async fn unset(proxy: &Proxy<'_>, subject: &str, relation: &str, target: &str) -> zbus::Result<()> {
+async fn unset(
+    proxy: &Proxy<'_>,
+    subject: &RelationEndpoint,
+    relation: &str,
+    target: &RelationEndpoint,
+) -> zbus::Result<()> {
     proxy
         .call_method("Unset", &(subject, relation, target))
         .await
@@ -123,31 +133,39 @@ fn session_metadata(agent_name: &str, session_id: &str) -> HashMap<String, Strin
     ])
 }
 
-fn agent_session_ref(agent_name: &str, session_id: &str) -> Option<String> {
+fn agent_session_ref(agent_name: &str, session_id: &str) -> Option<RelationEndpoint> {
     non_empty(session_id).map(|_| {
-        format!(
-            "agent-session:{}",
-            agent_session_node_key(agent_name, session_id)
+        stable_key(
+            AGENT_SESSION_KIND,
+            agent_session_node_key(agent_name, session_id),
         )
     })
 }
 
-fn window_ref(window_id: Option<&str>) -> Option<String> {
-    normalized_ref("niri-window", window_id)
+fn window_ref(window_id: Option<&str>) -> Option<RelationEndpoint> {
+    normalized_ref("niri-window", NIRI_WINDOW_KIND, window_id)
 }
 
-fn app_instance_ref(app_instance_id: Option<&str>) -> Option<String> {
-    normalized_ref("app-instance", app_instance_id)
+fn app_instance_ref(app_instance_id: Option<&str>) -> Option<RelationEndpoint> {
+    normalized_ref("app-instance", APP_INSTANCE_KIND, app_instance_id)
 }
 
-fn normalized_ref(kind: &str, value: Option<&str>) -> Option<String> {
+fn normalized_ref(prefix: &str, kind: &str, value: Option<&str>) -> Option<RelationEndpoint> {
     let value = non_empty(value?)?;
     let key = value
-        .strip_prefix(kind)
+        .strip_prefix(prefix)
         .and_then(|value| value.strip_prefix(':'))
         .or_else(|| value.strip_prefix("window:"))
         .unwrap_or(value);
-    non_empty(key).map(|key| format!("{kind}:{key}"))
+    non_empty(key).map(|key| stable_key(kind, key))
+}
+
+fn stable_key(kind: impl Into<String>, id: impl Into<String>) -> RelationEndpoint {
+    HashMap::from([
+        ("type".to_string(), "stable-key".to_string()),
+        ("kind".to_string(), kind.into()),
+        ("id".to_string(), id.into()),
+    ])
 }
 
 fn non_empty(value: &str) -> Option<&str> {
