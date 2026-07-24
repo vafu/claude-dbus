@@ -1,9 +1,7 @@
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-
 use agent_dbus_core::agent::is_gemini_agent;
 use agent_dbus_core::constants::socket_path;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,18 +17,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data: serde_json::Value =
         serde_json::from_str(stdin_data.trim()).unwrap_or(serde_json::Value::Null);
 
-    let selected_window = locusfs_selected_window_path();
-    let app_instance_id = std::env::var("LOCUS_APP_INSTANCE")
-        .ok()
-        .and_then(non_empty_string)
-        .or_else(|| locusfs_selected_app_instance_id(selected_window.as_deref()))
-        .unwrap_or_default();
-    let window_id = std::env::var("AGENT_DBUS_WINDOW")
-        .or_else(|_| std::env::var("AGENT_DBUS_WINDOW_ID"))
-        .ok()
-        .and_then(non_empty_string)
-        .or_else(|| locusfs_selected_window_id(selected_window.as_deref()))
-        .unwrap_or_default();
+    let app_instance_id =
+        first_non_empty_env(&["GHOSTTY_UUID", "LOCUS_APP_INSTANCE"]).unwrap_or_default();
+    let window_id = first_non_empty_env(&[
+        "NIRI_WINDOW_ID",
+        "AGENT_DBUS_WINDOW",
+        "AGENT_DBUS_WINDOW_ID",
+    ])
+    .unwrap_or_default();
 
     let msg = serde_json::json!({
         "agent": agent,
@@ -79,34 +73,14 @@ fn non_empty_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn locusfs_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("LOCUS_ROOT") {
-        return Some(PathBuf::from(root));
-    }
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return Some(PathBuf::from(runtime_dir).join("locusfs"));
-    }
-    std::env::var_os("UID")
-        .map(PathBuf::from)
-        .map(|uid| Path::new("/run/user").join(uid).join("locusfs"))
+fn first_non_empty_env(names: &[&str]) -> Option<String> {
+    first_non_empty(names.iter().map(|name| std::env::var(name).ok()))
 }
 
-fn locusfs_selected_window_path() -> Option<PathBuf> {
-    std::fs::canonicalize(locusfs_root()?.join("context/selected/window")).ok()
-}
-
-fn locusfs_selected_app_instance_id(selected_window: Option<&Path>) -> Option<String> {
-    let app_instance = std::fs::canonicalize(selected_window?.join("app-instance")).ok()?;
-    locusfs_node_ref("app-instance", &app_instance)
-}
-
-fn locusfs_selected_window_id(selected_window: Option<&Path>) -> Option<String> {
-    selected_window?.file_name()?.to_str().map(str::to_owned)
-}
-
-fn locusfs_node_ref(kind: &str, path: &Path) -> Option<String> {
-    let local_id = path.file_name()?.to_str()?;
-    Some(format!("{kind}:{local_id}"))
+fn first_non_empty(values: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    values
+        .into_iter()
+        .find_map(|value| value.and_then(non_empty_string))
 }
 
 fn owning_process_pid() -> Option<u32> {
@@ -163,9 +137,7 @@ fn parse_args() -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use super::{locusfs_node_ref, locusfs_selected_window_id, non_empty_string, parse_stat};
+    use super::{first_non_empty, non_empty_string, parse_stat};
 
     #[test]
     fn non_empty_string_trims_and_filters() {
@@ -177,20 +149,9 @@ mod tests {
     }
 
     #[test]
-    fn locusfs_node_ref_uses_basename() {
+    fn first_non_empty_skips_missing_and_blank_values() {
         assert_eq!(
-            locusfs_node_ref(
-                "app-instance",
-                Path::new("/run/user/1000/locusfs/app-instance/codex_1")
-            ),
-            Some("app-instance:codex_1".to_string())
-        );
-    }
-
-    #[test]
-    fn selected_window_id_uses_basename() {
-        assert_eq!(
-            locusfs_selected_window_id(Some(Path::new("/run/user/1000/locusfs/window/42"))),
+            first_non_empty([None, Some("  ".to_string()), Some(" 42 ".to_string())]),
             Some("42".to_string())
         );
     }

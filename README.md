@@ -138,6 +138,12 @@ The socket message format is:
 {"agent":"codex","event":"Stop","data":{ "...": "agent hook input" },"app_instance_id":"...","window_id":"..."}
 ```
 
+Hook metadata comes from the launching terminal environment. `app_instance_id`
+uses `GHOSTTY_UUID`, then `LOCUS_APP_INSTANCE`. `window_id` uses
+`NIRI_WINDOW_ID`, then `AGENT_DBUS_WINDOW`, then legacy `AGENT_DBUS_WINDOW_ID`.
+If none of those are set, `agent-hook` sends empty metadata instead of guessing
+from the currently focused window.
+
 ## Answer From A Terminal
 
 If the UI is unavailable, answer a pending request directly:
