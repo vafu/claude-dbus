@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::OnceLock;
 
 use tracing::{debug, warn};
 use zbus::{interface, object_server::SignalEmitter};
@@ -8,6 +9,22 @@ use crate::types::SessionState;
 use agent_dbus_core::path::session_path;
 
 const MAX_PENDING_REQUESTS_PER_SESSION: usize = 4;
+
+/// Serialises the "does this session object exist yet, and if not publish it"
+/// step. Hook connections are handled concurrently, so without this two hooks
+/// for a new session could both decide to create it and one update would be
+/// dropped on the floor.
+fn session_create_lock() -> &'static tokio::sync::Mutex<()> {
+    static SESSION_CREATE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SESSION_CREATE_LOCK.get_or_init(Default::default)
+}
+
+async fn session_exists(conn: &zbus::Connection, path: &zbus::zvariant::ObjectPath<'_>) -> bool {
+    conn.object_server()
+        .interface::<_, SessionObject>(path)
+        .await
+        .is_ok()
+}
 
 pub struct PendingRequest {
     pub id: String,
@@ -866,22 +883,6 @@ pub async fn emit_elicitation_with_id_and_details(
     .await
 }
 
-pub async fn create_session(
-    conn: &zbus::Connection,
-    agent_name: &str,
-    session_id: &str,
-) -> zbus::Result<()> {
-    let path = session_path(agent_name, session_id);
-    if let Err(err) = conn
-        .object_server()
-        .at(&path, SessionObject::new(agent_name, session_id))
-        .await
-    {
-        warn!(%err, %session_id, "failed to create session object");
-    }
-    Ok(())
-}
-
 pub async fn update_session(
     conn: &zbus::Connection,
     agent_name: &str,
@@ -889,17 +890,38 @@ pub async fn update_session(
     f: impl FnOnce(&mut SessionObject),
 ) -> zbus::Result<()> {
     let path = session_path(agent_name, session_id);
-    let created = conn
-        .object_server()
-        .at(&path, SessionObject::new(agent_name, session_id))
-        .await
-        .map_err(|err| {
-            warn!(%err, %session_id, "failed to ensure session object");
-            err
-        })?;
-    if created {
-        debug!(session_id = %session_id, "auto-created session object");
+
+    // Apply the update to the object *before* publishing it, so the
+    // ObjectManager `InterfacesAdded` payload carries real metadata. Publishing
+    // first and then emitting `PropertiesChanged` announces the session with
+    // `WindowId ""`, `State "no-session"` and `Cwd ""`; consumers that snapshot
+    // properties out of `InterfacesAdded` instead of following
+    // `PropertiesChanged` then cache those empty values forever and can never
+    // match the session to its window.
+    {
+        let _create_guard = session_create_lock().lock().await;
+        if !session_exists(conn, &path).await {
+            let mut session = SessionObject::new(agent_name, session_id);
+            f(&mut session);
+            let created = conn
+                .object_server()
+                .at(&path, session)
+                .await
+                .map_err(|err| {
+                    warn!(%err, %session_id, "failed to create session object");
+                    err
+                })?;
+            if created {
+                debug!(session_id = %session_id, "created session object with initial state");
+                return Ok(());
+            }
+            // Unreachable while every creator takes `session_create_lock`. Fall
+            // through rather than silently dropping the update if that changes.
+            warn!(%session_id, "session object appeared while creating it");
+            return Ok(());
+        }
     }
+
     let iface_ref = conn
         .object_server()
         .interface::<_, SessionObject>(&path)

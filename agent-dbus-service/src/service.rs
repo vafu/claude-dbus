@@ -5,19 +5,19 @@ use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
 use crate::dbus::{PendingRequest, SessionObject};
-use crate::providers::codex::parent::maybe_watch_codex_parent;
 use crate::providers::codex::subagent::{SubagentInfo, codex_subagent_info};
 use crate::providers::codex::title::codex_thread_title;
 use crate::providers::gemini::is_gemini_agent;
 use crate::request_broker::global_request_broker;
+use crate::session_parents::maybe_watch_parent;
 use crate::session_store::{
-    create_session, emit_elicitation, emit_elicitation_with_details, emit_elicitation_with_id,
+    emit_elicitation, emit_elicitation_with_details, emit_elicitation_with_id,
     emit_elicitation_with_id_and_details, emit_notification, log_zbus_result, remove_session,
     subagent_parent_session_id, update_session,
 };
 use crate::socket::read_raw_hook;
 use crate::types::SessionState;
-use crate::{CodexSessionParents, EndedSessions};
+use crate::{EndedSessions, SessionParents};
 use agent_dbus_core::path::{session_key, session_path};
 
 mod metrics;
@@ -55,7 +55,7 @@ pub async fn handle_hook_connection(
     mut stream: tokio::net::UnixStream,
     conn: zbus::Connection,
     ended: EndedSessions,
-    codex_session_parents: CodexSessionParents,
+    session_parents: SessionParents,
 ) {
     let Some(hook) = read_raw_hook(&mut stream).await else {
         return;
@@ -69,15 +69,17 @@ pub async fn handle_hook_connection(
     info!(agent = %agent_name, event = %event, session_id = %session_id, "hook received");
     tracing::debug!(data = %data, "hook data");
 
-    refresh_session_title(&conn, &agent_name, &session_id, data).await;
-
-    maybe_watch_codex_parent(
-        &codex_session_parents,
+    refresh_session_title(
+        &conn,
         &agent_name,
         &session_id,
-        hook.parent_pid,
+        app_instance_id.as_deref(),
+        window_id.as_deref(),
+        data,
     )
     .await;
+
+    maybe_watch_parent(&session_parents, &agent_name, &session_id, hook.parent_pid).await;
 
     match event.as_str() {
         "UpdateState" => {
@@ -128,11 +130,6 @@ pub async fn handle_hook_connection(
             let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
             let model = model_name(data);
             log_zbus_result(
-                create_session(&conn, &agent_name, &session_id).await,
-                "create_session",
-                &session_id,
-            );
-            log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     apply_transport_metadata(
                         d,
@@ -162,14 +159,7 @@ pub async fn handle_hook_connection(
                 subagent_parent_session_id(&conn, &agent_name, &session_id).await
             };
             if parent_session_id.is_some() {
-                remove_session(
-                    &conn,
-                    &ended,
-                    &codex_session_parents,
-                    &agent_name,
-                    &session_id,
-                )
-                .await;
+                remove_session(&conn, &ended, &session_parents, &agent_name, &session_id).await;
                 info!(agent = %agent_name, session_id = %session_id, "removed subagent session after Stop");
                 return;
             }
@@ -195,14 +185,7 @@ pub async fn handle_hook_connection(
         }
 
         "SessionEnd" => {
-            remove_session(
-                &conn,
-                &ended,
-                &codex_session_parents,
-                &agent_name,
-                &session_id,
-            )
-            .await;
+            remove_session(&conn, &ended, &session_parents, &agent_name, &session_id).await;
         }
 
         "TaskCompleted" => {
@@ -292,6 +275,8 @@ pub async fn handle_hook_connection(
                 &conn,
                 &agent_name,
                 &session_id,
+                app_instance_id.as_deref(),
+                window_id.as_deref(),
                 ElicitationRequest {
                     prompt: build_permission_prompt(data),
                     detail_kind: detail.kind,
@@ -418,6 +403,8 @@ pub async fn handle_hook_connection(
                 &conn,
                 &agent_name,
                 &session_id,
+                app_instance_id.as_deref(),
+                window_id.as_deref(),
                 ElicitationRequest {
                     prompt: build_permission_prompt(data),
                     detail_kind: detail.kind,
@@ -448,6 +435,8 @@ pub async fn handle_hook_connection(
                 &conn,
                 &agent_name,
                 &session_id,
+                app_instance_id.as_deref(),
+                window_id.as_deref(),
                 ElicitationRequest {
                     prompt,
                     detail_kind: String::new(),
@@ -745,6 +734,8 @@ async fn refresh_session_title(
     conn: &zbus::Connection,
     agent_name: &str,
     session_id: &str,
+    app_instance_id: Option<&str>,
+    window_id: Option<&str>,
     data: &serde_json::Value,
 ) {
     let Some(title) = session_title(agent_name, session_id, data) else {
@@ -755,6 +746,10 @@ async fn refresh_session_title(
     }
     log_zbus_result(
         update_session(conn, agent_name, session_id, |d| {
+            // This runs ahead of the per-event handlers, so it can be what first
+            // publishes the session. Seed the transport metadata too, otherwise
+            // the session would be announced with an empty `WindowId`.
+            apply_transport_metadata(d, session_id, app_instance_id, window_id);
             d.session_title = title;
         })
         .await,
@@ -882,19 +877,24 @@ async fn handle_elicitation_event(
     conn: &zbus::Connection,
     agent_name: &str,
     session_id: &str,
+    app_instance_id: Option<&str>,
+    window_id: Option<&str>,
     request: ElicitationRequest,
 ) -> String {
     use tokio::sync::oneshot;
     info!(agent = %agent_name, session_id = %session_id, prompt = %request.prompt, ?request.options, "elicitation");
 
     let path = session_path(agent_name, session_id);
-    if let Err(err) = conn
-        .object_server()
-        .at(&path, SessionObject::new(agent_name, session_id))
-        .await
-    {
-        warn!(%err, %session_id, "failed to ensure session object for elicitation");
-    }
+    // Goes through `update_session` so a session first seen via an elicitation
+    // is still published with its transport metadata already set.
+    log_zbus_result(
+        update_session(conn, agent_name, session_id, |d| {
+            apply_transport_metadata(d, session_id, app_instance_id, window_id);
+        })
+        .await,
+        "update_session",
+        session_id,
+    );
     let iface_ref = match conn
         .object_server()
         .interface::<_, SessionObject>(&path)

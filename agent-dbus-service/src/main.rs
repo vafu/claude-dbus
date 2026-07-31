@@ -15,12 +15,14 @@ mod locus;
 mod providers;
 mod request_broker;
 mod service;
+mod session_parents;
 mod session_store;
 mod socket;
 mod types;
 
 pub type EndedSessions = Arc<Mutex<ExpiringSessionSet>>;
-pub type CodexSessionParents = Arc<Mutex<HashMap<String, u32>>>;
+/// Maps `<agent>:<session-id>` to the pid of the agent process owning it.
+pub type SessionParents = Arc<Mutex<HashMap<String, u32>>>;
 
 pub struct ExpiringSessionSet {
     entries: HashMap<String, Instant>,
@@ -101,13 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1024,
         Duration::from_secs(10 * 60),
     )));
-    let codex_session_parents: CodexSessionParents = Arc::new(Mutex::new(HashMap::new()));
+    let session_parents: SessionParents = Arc::new(Mutex::new(HashMap::new()));
     providers::codex::compact::start_codex_compact_watcher(conn.clone());
     providers::codex::title::start_codex_title_watcher(conn.clone());
-    providers::codex::parent::start_codex_parent_watcher(
+    session_parents::start_parent_watcher(
         conn.clone(),
         Arc::clone(&ended),
-        Arc::clone(&codex_session_parents),
+        Arc::clone(&session_parents),
     );
 
     loop {
@@ -115,10 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((stream, _)) => {
                 let conn = conn.clone();
                 let ended = Arc::clone(&ended);
-                let codex_session_parents = Arc::clone(&codex_session_parents);
+                let session_parents = Arc::clone(&session_parents);
                 tokio::spawn(async move {
-                    service::handle_hook_connection(stream, conn, ended, codex_session_parents)
-                        .await;
+                    service::handle_hook_connection(stream, conn, ended, session_parents).await;
                 });
             }
             Err(e) => info!("Socket accept error: {}", e),

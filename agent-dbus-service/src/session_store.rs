@@ -1,21 +1,13 @@
 use tracing::{debug, warn};
 
 use crate::dbus::{self, SessionObject};
-use crate::{CodexSessionParents, EndedSessions};
+use crate::{EndedSessions, SessionParents};
 use agent_dbus_core::path::{session_key, session_path};
 
 pub(crate) use crate::dbus::{
     emit_elicitation, emit_elicitation_with_details, emit_elicitation_with_id,
     emit_elicitation_with_id_and_details, emit_notification,
 };
-
-pub(crate) async fn create_session(
-    conn: &zbus::Connection,
-    agent_name: &str,
-    session_id: &str,
-) -> zbus::Result<()> {
-    dbus::create_session(conn, agent_name, session_id).await
-}
 
 pub(crate) async fn update_session(
     conn: &zbus::Connection,
@@ -38,13 +30,13 @@ pub(crate) async fn update_existing_session(
 pub(crate) async fn remove_session(
     conn: &zbus::Connection,
     ended: &EndedSessions,
-    codex_session_parents: &CodexSessionParents,
+    session_parents: &SessionParents,
     agent_name: &str,
     session_id: &str,
 ) {
     let key = session_key(agent_name, session_id);
     ended.lock().await.insert(key.clone());
-    codex_session_parents.lock().await.remove(&key);
+    session_parents.lock().await.remove(&key);
     let path = session_path(agent_name, session_id);
     let mut app_instance_id = None;
     let mut window_id = None;

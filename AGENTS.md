@@ -170,9 +170,13 @@ Lifecycle rules:
 - `Stop`/`AfterAgent` mark top-level sessions `idle` and `TaskComplete=true`.
 - `Stop` for subagent sessions removes the subagent session object.
 - `SessionEnd` removes the session object.
-- Codex top-level sessions are also cleaned up when the originating Codex
-  parent process exits, because Codex does not expose a dedicated session-end
-  hook.
+- Top-level sessions for any agent are also cleaned up when the owning agent
+  process exits. Codex exposes no session-end hook at all, and for every agent
+  the hook never runs when the terminal is killed, so hook-based removal cannot
+  be relied on alone.
+- `agent-hook` only reports an owning pid when it finds an ancestor process
+  named after the agent. Unidentified owners are left unwatched, since reaping
+  the wrong pid would remove live sessions.
 - Codex compact state is inferred from the Codex TUI log watcher because Codex
   does not expose a compact hook.
 

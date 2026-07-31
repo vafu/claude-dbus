@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "event": event,
         "data": data,
         "hook_pid": std::process::id(),
-        "parent_pid": owning_process_pid(),
+        "parent_pid": owning_process_pid(&agent),
         "app_instance_id": app_instance_id,
         "window_id": window_id,
     });
@@ -83,24 +83,32 @@ fn first_non_empty(values: impl IntoIterator<Item = Option<String>>) -> Option<S
         .find_map(|value| value.and_then(non_empty_string))
 }
 
-fn owning_process_pid() -> Option<u32> {
-    let direct_parent = process_parent_pid(std::process::id())?;
-    let mut pid = direct_parent;
+/// Walks up the process tree looking for the agent process that owns this hook,
+/// identified by an ancestor whose process name contains the agent name.
+///
+/// Returns `None` when no such ancestor is found. The bridge uses this pid to
+/// remove the session once the agent exits, so guessing — at the immediate
+/// parent, which can be a short-lived wrapper shell — would delete sessions
+/// that are still live. No pid means no process-exit cleanup for that session,
+/// which is the safe direction to fail in.
+fn owning_process_pid(agent: &str) -> Option<u32> {
+    let agent = agent.trim().to_ascii_lowercase();
+    if agent.is_empty() {
+        return None;
+    }
 
+    let mut pid = process_parent_pid(std::process::id())?;
     for _ in 0..32 {
         if process_name(pid)
             .as_deref()
-            .is_some_and(|name| name.contains("codex"))
+            .is_some_and(|name| name.to_ascii_lowercase().contains(&agent))
         {
             return Some(pid);
         }
-        let Some(parent_pid) = process_parent_pid(pid) else {
-            break;
-        };
-        pid = parent_pid;
+        pid = process_parent_pid(pid)?;
     }
 
-    Some(direct_parent)
+    None
 }
 
 fn process_parent_pid(pid: u32) -> Option<u32> {
@@ -137,7 +145,13 @@ fn parse_args() -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_non_empty, non_empty_string, parse_stat};
+    use super::{first_non_empty, non_empty_string, owning_process_pid, parse_stat};
+
+    #[test]
+    fn owning_process_pid_does_not_guess_at_an_unrelated_ancestor() {
+        assert_eq!(owning_process_pid("no-such-process-name-exists"), None);
+        assert_eq!(owning_process_pid("   "), None);
+    }
 
     #[test]
     fn non_empty_string_trims_and_filters() {

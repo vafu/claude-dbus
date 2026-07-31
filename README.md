@@ -27,7 +27,9 @@ agent-dbus-locusfs-proxy         (mirrors D-Bus sessions into locusfs nodes/syml
 
 The service stores sessions under both agent name and session id, so `claude`, `codex`, and `gemini` sessions can run at the same time without object-path collisions.
 
-Codex does not currently expose a `SessionEnd` command hook. For Codex hook messages, `agent-hook` includes the parent Codex process id and `agent-dbus` removes top-level session objects after that process exits. `Stop` still means turn completion for top-level sessions. Codex subagent sessions are identified from Codex session metadata and are removed when their own `Stop` hook arrives.
+Hook-based session end is not sufficient on its own: Codex exposes no `SessionEnd` command hook at all, and for every agent the hook never runs if the terminal is killed. So `agent-hook` reports the pid of the owning agent process and `agent-dbus` removes top-level session objects once that process exits. `agent-hook` identifies that process by walking up the process tree for an ancestor whose name contains the agent name; if none is found it reports no pid and the session is left unwatched, because reaping the wrong pid (a short-lived wrapper shell, say) would delete live sessions.
+
+`Stop` still means turn completion for top-level sessions. Codex subagent sessions are identified from Codex session metadata and are removed when their own `Stop` hook arrives.
 
 Codex also does not expose a compact lifecycle hook. To surface `compacting` state for Codex sessions, `agent-dbus` watches the local Codex TUI log for `op.dispatch.compact` start/close lines and maps those `thread_id` values back to Codex session objects. All regular lifecycle events, approval/input requests, and session metrics still flow through the Unix socket hook path.
 
@@ -182,7 +184,7 @@ Add hooks to `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`:
 
 When Codex auto-review is enabled (`approvals_reviewer = "auto_review"` or `"guardian_subagent"`), `agent-dbus` defers the initial `PermissionRequest` hook without showing a dialog so Codex's reviewer can decide first. Dialogs are shown only for payloads that identify a reviewer-denied fallback, or when Codex is using the normal user reviewer.
 
-Codex session objects are cleaned up automatically when the originating Codex process exits.
+Codex session objects are cleaned up automatically when the originating Codex process exits, as they are for every other agent.
 
 ## Configure Gemini CLI Hooks
 
@@ -245,6 +247,18 @@ Add hooks to `~/.claude/settings.json`:
 **Interface:** `org.freedesktop.DBus.ObjectManager`
 
 Use `GetManagedObjects` to list all active sessions.
+
+A session object is published only after the triggering hook has been applied to
+it, so its `InterfacesAdded` payload already carries the real `WindowId`,
+`AppInstanceId`, `State` and `Cwd` rather than empty defaults. Consumers that
+snapshot properties out of `InterfacesAdded` — rather than following
+`PropertiesChanged` on the session path — can therefore match a session to its
+window as soon as it appears.
+
+Note that properties still change afterwards. `WindowId` in particular is
+normally fixed for the life of a session, but it does change if the same session
+id is resumed in a different terminal window, so a consumer that needs to follow
+that must watch `PropertiesChanged`.
 
 ### Session Objects
 
