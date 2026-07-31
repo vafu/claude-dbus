@@ -346,4 +346,22 @@ busctl --user call io.github.AgentDBus /io/github/AgentDBus org.freedesktop.DBus
 | `RequiresAttention` | `PermissionRequest`, Gemini `BeforeTool`, `Elicitation`, `RequestUserInput`, `PlanModePrompt`, `AgentTurnCompleteAttention`, `ToolSuggestion`, native Codex approval aliases, `AttentionRequired` | `PostToolUse`, `AfterTool`, user response, matching `*Resolved` events, `AttentionResolved`, `UserPromptSubmit`, `BeforeAgent` |
 
 Non-blocking attention events use internal reason keys so overlapping prompts do not clear each other. `AttentionRequired` and `AttentionResolved` accept `reason`, `kind`, or `attention_kind` in the hook data; if omitted, the reason is `attention`.
+
+`RequiresAttention` is derived from both the attention reasons and the pending
+request list, so a pending request keeps it set until that request is retired.
+Agents may prompt in their own UI as well as through the hook, which leaves the
+bridge holding a request nobody will answer. Two things retire those:
+
+- A `PostToolUse`/`AfterTool` whose `tool_name` matches the request's tool. The
+  tool only runs once the prompt is answered, so the request is moot. Matching
+  is scoped to that tool because other tools may still be waiting on prompts of
+  their own.
+- A turn boundary — `SessionStart`, `Stop`/`AfterAgent`, `TaskCompleted`,
+  `UserPromptSubmit`/`BeforeAgent`/`BeforeModel`/`BeforeToolSelection`,
+  `PreCompact`/`PreCompress` — which cancels every pending request on the
+  session.
+
+Retiring a request this way cancels it, so the blocked hook returns immediately
+with no answer and the agent falls back to its own decision, rather than waiting
+out `AGENT_DBUS_ELICITATION_TIMEOUT_SECS` (10 minutes by default).
 Native Codex approval aliases are `ExecApprovalRequest`, `ApplyPatchApprovalRequest`, `RequestPermissions`, and `McpServerElicitationRequest`, with matching `*Resolved` events.

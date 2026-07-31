@@ -28,6 +28,11 @@ async fn session_exists(conn: &zbus::Connection, path: &zbus::zvariant::ObjectPa
 
 pub struct PendingRequest {
     pub id: String,
+    /// Tool this request is gating, when it came from a tool-permission hook.
+    /// Lets a later `PostToolUse` for the same tool retire the request: the
+    /// agent only runs the tool once the prompt has been answered, and it may
+    /// have been answered in the agent's own UI rather than through us.
+    pub tool_name: String,
     pub prompt: String,
     pub detail_kind: String,
     pub detail_text: String,
@@ -355,6 +360,31 @@ impl SessionObject {
         count
     }
 
+    /// Cancels pending requests gating `tool_name`, leaving any others alone.
+    ///
+    /// Used when a tool completes: agents can run several tools concurrently, so
+    /// a blanket cancel here would retire prompts that are still genuinely
+    /// waiting.
+    pub fn cancel_pending_requests_for_tool(&mut self, tool_name: &str) -> usize {
+        if tool_name.is_empty() {
+            return 0;
+        }
+        let mut cancelled = Vec::new();
+        self.pending_requests.retain(|request| {
+            if request.tool_name == tool_name {
+                cancelled.push(request.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.refresh_requires_attention();
+        for request_id in &cancelled {
+            global_request_broker().cancel(request_id);
+        }
+        cancelled.len()
+    }
+
     pub fn set_attention_reason(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         if !reason.is_empty() {
@@ -403,8 +433,13 @@ mod tests {
     use super::*;
 
     fn pending_request(id: &str) -> PendingRequest {
+        pending_request_for_tool(id, "")
+    }
+
+    fn pending_request_for_tool(id: &str, tool_name: &str) -> PendingRequest {
         PendingRequest {
             id: id.to_string(),
+            tool_name: tool_name.to_string(),
             prompt: format!("prompt {id}"),
             detail_kind: "text".to_string(),
             detail_text: format!("detail {id}"),
@@ -473,6 +508,48 @@ mod tests {
 
         assert!(session.pending_requests.is_empty());
         assert!(!session.requires_attention);
+    }
+
+    #[test]
+    fn cancelling_for_a_tool_leaves_other_tools_waiting() {
+        let mut session = SessionObject::new("claude", "session-1");
+        session.push_pending_request(pending_request_for_tool("req-1", "AskUserQuestion"));
+        session.push_pending_request(pending_request_for_tool("req-2", "Bash"));
+
+        assert_eq!(
+            session.cancel_pending_requests_for_tool("AskUserQuestion"),
+            1
+        );
+        assert_eq!(session.pending_request_ids_value(), vec!["req-2"]);
+        // Still asking for attention on behalf of the request that remains.
+        assert!(session.requires_attention);
+
+        assert_eq!(session.cancel_pending_requests_for_tool("Bash"), 1);
+        assert!(session.pending_requests.is_empty());
+        assert!(!session.requires_attention);
+    }
+
+    #[test]
+    fn cancelling_for_an_unknown_tool_keeps_every_request() {
+        let mut session = SessionObject::new("claude", "session-1");
+        session.push_pending_request(pending_request_for_tool("req-1", "AskUserQuestion"));
+
+        assert_eq!(session.cancel_pending_requests_for_tool(""), 0);
+        assert_eq!(session.cancel_pending_requests_for_tool("Bash"), 0);
+        assert_eq!(session.pending_request_ids_value(), vec!["req-1"]);
+        assert!(session.requires_attention);
+    }
+
+    #[test]
+    fn cancelling_every_request_drops_attention() {
+        let mut session = SessionObject::new("claude", "session-1");
+        session.push_pending_request(pending_request_for_tool("req-1", "AskUserQuestion"));
+        session.set_attention_reason("plan-mode-prompt");
+        assert!(session.requires_attention);
+
+        assert_eq!(session.cancel_pending_requests(), 1);
+        assert!(!session.requires_attention);
+        assert!(session.attention_reasons_value().is_empty());
     }
 
     #[test]

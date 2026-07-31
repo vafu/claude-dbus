@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, timeout};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::dbus::{PendingRequest, SessionObject};
 use crate::providers::codex::subagent::{SubagentInfo, codex_subagent_info};
@@ -44,6 +44,8 @@ static NEXT_PENDING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_ELICITATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 struct ElicitationRequest {
+    /// Empty for requests that do not gate a specific tool.
+    tool_name: String,
     prompt: String,
     detail_kind: String,
     detail_text: String,
@@ -143,7 +145,7 @@ pub async fn handle_hook_connection(
                     apply_usage_limits(d, &agent_name, &session_id, data);
                     apply_subagent_info(d, subagent_info.as_ref());
                     d.task_complete = false;
-                    clear_pending_if_not_waiting(d);
+                    clear_pending_and_attention(d);
                 })
                 .await,
                 "update_session",
@@ -173,7 +175,7 @@ pub async fn handle_hook_connection(
                         window_id.as_deref(),
                     );
                     mark_turn_complete(d);
-                    clear_pending_if_not_waiting(d);
+                    clear_pending_and_attention(d);
                     d.model_name = model.clone();
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -198,7 +200,7 @@ pub async fn handle_hook_connection(
                         window_id.as_deref(),
                     );
                     mark_turn_complete(d);
-                    clear_pending_if_not_waiting(d);
+                    clear_pending_and_attention(d);
                 })
                 .await,
                 "update_session",
@@ -218,7 +220,7 @@ pub async fn handle_hook_connection(
                     );
                     d.state = SessionState::Thinking;
                     d.task_complete = false;
-                    clear_pending_if_not_waiting(d);
+                    clear_pending_and_attention(d);
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -278,6 +280,7 @@ pub async fn handle_hook_connection(
                 app_instance_id.as_deref(),
                 window_id.as_deref(),
                 ElicitationRequest {
+                    tool_name: hook_tool_name(data),
                     prompt: build_permission_prompt(data),
                     detail_kind: detail.kind,
                     detail_text: detail.text,
@@ -329,6 +332,19 @@ pub async fn handle_hook_connection(
                     );
                     d.state = SessionState::Thinking;
                     clear_transient_attention(d);
+                    // The tool ran, so its approval prompt has been answered —
+                    // possibly in the agent's own UI, which leaves our request
+                    // orphaned. Scoped to this tool because other tools may
+                    // still be waiting on prompts of their own.
+                    let cancelled = d.cancel_pending_requests_for_tool(&hook_tool_name(data));
+                    if cancelled > 0 {
+                        debug!(
+                            %session_id,
+                            cancelled,
+                            tool = %hook_tool_name(data),
+                            "cancelled approval requests for a tool that already ran"
+                        );
+                    }
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -367,7 +383,7 @@ pub async fn handle_hook_connection(
                         window_id.as_deref(),
                     );
                     d.state = SessionState::Compacting;
-                    clear_pending_if_not_waiting(d);
+                    clear_pending_and_attention(d);
                 })
                 .await,
                 "update_session",
@@ -406,6 +422,7 @@ pub async fn handle_hook_connection(
                 app_instance_id.as_deref(),
                 window_id.as_deref(),
                 ElicitationRequest {
+                    tool_name: hook_tool_name(data),
                     prompt: build_permission_prompt(data),
                     detail_kind: detail.kind,
                     detail_text: detail.text,
@@ -438,6 +455,7 @@ pub async fn handle_hook_connection(
                 app_instance_id.as_deref(),
                 window_id.as_deref(),
                 ElicitationRequest {
+                    tool_name: String::new(),
                     prompt,
                     detail_kind: String::new(),
                     detail_text: String::new(),
@@ -911,6 +929,7 @@ async fn handle_elicitation_event(
         let mut iface = iface_ref.get_mut().await;
         if !iface.push_pending_request(PendingRequest {
             id: request_id.clone(),
+            tool_name: request.tool_name.clone(),
             prompt: request.prompt.clone(),
             detail_kind: request.detail_kind,
             detail_text: request.detail_text,
@@ -1010,8 +1029,17 @@ fn elicitation_timeout() -> Duration {
         .unwrap_or(DEFAULT_ELICITATION_TIMEOUT)
 }
 
-fn clear_pending_if_not_waiting(session: &mut SessionObject) {
-    session.clear_attention_reasons();
+/// Retires everything asking for attention at a turn boundary.
+///
+/// Only ever called for events that mean the turn moved past any prompt
+/// (session start/end of turn, a new user prompt, compaction), so an approval
+/// request still sitting here was answered somewhere else — typically in the
+/// agent's own UI, which leaves our copy of the request orphaned. Cancelling
+/// releases the blocked hook instead of leaving it to time out, and clearing
+/// the reasons alone would not drop `RequiresAttention`, because that is also
+/// derived from the pending request list.
+fn clear_pending_and_attention(session: &mut SessionObject) {
+    session.cancel_pending_requests();
 }
 
 fn clear_transient_attention(session: &mut SessionObject) {
@@ -1033,6 +1061,10 @@ fn apply_nonblocking_attention(
     session.model_name = model_name(data);
     session.cwd = data["cwd"].as_str().unwrap_or("").to_string();
     apply_usage_limits(session, agent_name, session_id, data);
+}
+
+fn hook_tool_name(data: &serde_json::Value) -> String {
+    data["tool_name"].as_str().unwrap_or("").to_string()
 }
 
 fn attention_reason(data: &serde_json::Value) -> String {
