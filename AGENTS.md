@@ -34,7 +34,12 @@ into the same stable D-Bus surface.
   bookkeeping.
 - `agent-dbus-service/src/providers` owns provider-specific helpers such as
   Codex parent-process cleanup, Codex compact log watching, Codex subagent
-  metadata, Gemini aliases, and metrics parsing.
+  metadata, Gemini aliases, OpenCode permission replies and subagent
+  metadata, and metrics parsing.
+- `opencode-plugin/agent-dbus.js` is the OpenCode plugin that forwards
+  OpenCode session/tool/permission lifecycle into `agent-hook` events. It is
+  plain JavaScript with no dependencies so users can copy it into their
+  OpenCode plugin directory without a build step.
 - `agent-dbus-locusfs-proxy` is optional legacy/adjacent integration that mirrors
   active AgentDBus sessions into LocusFS graph nodes. The main service does not
   write LocusFS directly.
@@ -241,21 +246,21 @@ Lifecycle rules:
 Useful commands:
 
 ```sh
-CARGO_TARGET_DIR=/tmp/claude-dbus-target cargo test --workspace
+CARGO_TARGET_DIR=/tmp/agent-dbus-target cargo test --workspace
 cargo fmt --check
 ```
 
 Narrow checks:
 
 ```sh
-CARGO_TARGET_DIR=/tmp/claude-dbus-target cargo test -p agent-dbus hook_state_accepts_status_line_shapes
-CARGO_TARGET_DIR=/tmp/claude-dbus-target cargo test -p agent-dbus selected_window_id_uses_basename
+CARGO_TARGET_DIR=/tmp/agent-dbus-target cargo test -p agent-dbus hook_state_accepts_status_line_shapes
+CARGO_TARGET_DIR=/tmp/agent-dbus-target cargo test -p agent-dbus selected_window_id_uses_basename
 ```
 
 Install/restart when the running bridge should reflect changes:
 
 ```sh
-env CARGO_TARGET_DIR=/tmp/claude-dbus-target cargo install --path agent-dbus-service --locked --force --root /home/v47/.cargo
+env CARGO_TARGET_DIR=/tmp/agent-dbus-target cargo install --path agent-dbus-service --locked --force --root /home/v47/.cargo
 systemctl --user restart agent-dbus.service
 systemctl --user status agent-dbus.service --no-pager
 ```

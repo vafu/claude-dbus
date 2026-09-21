@@ -238,6 +238,59 @@ Add hooks to `~/.claude/settings.json`:
 }
 ```
 
+## Configure OpenCode Hooks
+
+OpenCode integrates through a plugin rather than command hooks. Copy
+`opencode-plugin/agent-dbus.js` from this repository to
+`~/.config/opencode/plugins/agent-dbus.js` (global) or
+`<project>/.opencode/plugins/agent-dbus.js` (project), then restart OpenCode:
+
+```bash
+mkdir -p ~/.config/opencode/plugins
+cp opencode-plugin/agent-dbus.js ~/.config/opencode/plugins/agent-dbus.js
+```
+
+The plugin forwards OpenCode lifecycle into the same hook events the other
+agents use:
+
+| OpenCode | agent-dbus event |
+|----------|------------------|
+| `session.created` | `SessionStart` |
+| `chat.message` | `UserPromptSubmit` (thinking) |
+| `chat.params` | `BeforeModel` (thinking + model) |
+| `tool.execute.before` | `PreToolUse` (tool-use) |
+| `tool.execute.after` | `PostToolUse` (thinking) |
+| `session.status` idle / `session.idle` | `Stop` (idle + task complete) |
+| `session.status` busy | `UpdateState` (thinking) |
+| `session.deleted` | `SessionEnd` (removes the session) |
+| `experimental.session.compacting` | `PreCompact` (compacting) |
+| `session.compacted` | `UpdateState` (idle) |
+| `session.updated` | `UpdateState` (title/model/cost sync) |
+| `session.error` | `Notification` |
+| `permission.asked` | `PermissionRequest` (blocking approval) |
+| `question.asked` | `AttentionRequired` with reason `question` |
+
+Approval behavior notes:
+
+- Answering in the shell UI replies `once` (`Allow`), `always`
+  (`Always allow`), or `reject` (`Deny`) through OpenCode's permission API.
+  Replies bypass the plugin SDK client and POST to the live OpenCode
+  listener instead, because plugin SDK replies are silently dropped upstream
+  (anomalyco/opencode#28037). The `permission.ask` hook itself never fires
+  upstream (anomalyco/opencode#7006), so approvals use the
+  `permission.asked` event path.
+- Approving or denying in OpenCode's own UI first wins; the bridge copy of
+  the request retires at the next turn boundary.
+- `question` tool prompts are surfaced as attention only and must be
+  answered in OpenCode's UI.
+- OpenCode subagent sessions carry a parent id, so they are tracked as
+  subagents (`IsSubagent`, `ParentSessionId`) and removed on `Stop`, like
+  Codex subagents.
+
+When `agent-dbus` is not running (or `agent-hook` is missing), every plugin
+hook degrades to a silent no-op and OpenCode keeps working with its native
+approval prompts.
+
 ## D-Bus Interface
 
 ### Root Object

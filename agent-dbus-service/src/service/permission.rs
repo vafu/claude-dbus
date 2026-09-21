@@ -1,4 +1,4 @@
-use crate::providers::{codex, gemini};
+use crate::providers::{codex, gemini, opencode};
 
 const WRITE_DETAIL_PREVIEW_CHARS: usize = 20_000;
 
@@ -169,6 +169,11 @@ pub(super) fn build_permission_options(data: &serde_json::Value) -> Vec<String> 
     if always_allow_options.is_empty() && codex::permissions::prefix_rule(data).is_some() {
         always_allow_options.push("Always allow".to_string());
     }
+    // OpenCode advertises persistable patterns in `always`. Offering the option
+    // lets the shell UI grant `always` replies; no other agent sends this field.
+    if always_allow_options.is_empty() && has_persistable_always_patterns(data) {
+        always_allow_options.push("Always allow".to_string());
+    }
     options.append(&mut always_allow_options);
     options.push("Deny".to_string());
     options
@@ -325,6 +330,12 @@ fn persist_value_includes(value: &serde_json::Value, needle: &str) -> bool {
         })
 }
 
+fn has_persistable_always_patterns(data: &serde_json::Value) -> bool {
+    data["always"]
+        .as_array()
+        .is_some_and(|patterns| !patterns.is_empty())
+}
+
 fn has_allow_option(options: &[String]) -> bool {
     options.iter().any(|option| {
         let normalized = option.trim().to_ascii_lowercase();
@@ -351,6 +362,9 @@ pub(super) fn permission_response(
     let answer = answer.trim();
     if gemini::is_gemini_agent(agent_name) {
         return gemini::permission_response(answer);
+    }
+    if let Some(response) = opencode::permission_response(agent_name, answer) {
+        return Some(response);
     }
 
     if is_always_allow_answer(answer) {

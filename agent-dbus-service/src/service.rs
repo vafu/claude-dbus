@@ -129,7 +129,7 @@ pub async fn handle_hook_connection(
         }
 
         "SessionStart" => {
-            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
+            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             let model = model_name(data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
@@ -154,7 +154,7 @@ pub async fn handle_hook_connection(
         }
 
         "Stop" | "AfterAgent" => {
-            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
+            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             let parent_session_id = if let Some(info) = subagent_info.as_ref() {
                 Some(info.parent_session_id.clone())
             } else {
@@ -209,7 +209,7 @@ pub async fn handle_hook_connection(
         }
 
         "UserPromptSubmit" | "BeforeAgent" | "BeforeModel" | "BeforeToolSelection" => {
-            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
+            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     apply_transport_metadata(
@@ -299,7 +299,7 @@ pub async fn handle_hook_connection(
         }
 
         "PreToolUse" | "BeforeTool" => {
-            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
+            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     apply_transport_metadata(
@@ -321,7 +321,7 @@ pub async fn handle_hook_connection(
         }
 
         "PostToolUse" | "AfterTool" => {
-            let subagent_info = codex_subagent_info(&agent_name, &session_id, data);
+            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     apply_transport_metadata(
@@ -803,6 +803,20 @@ fn model_name(data: &serde_json::Value) -> String {
         .or_else(|| data["llm_request"]["model"].as_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// Resolves subagent metadata for any agent with a known encoding.
+///
+/// Codex embeds subagent lineage in its hook payloads; OpenCode tracks
+/// subagents as child sessions with a parent id. Returns `None` for
+/// top-level sessions.
+fn hook_subagent_info(
+    agent_name: &str,
+    session_id: &str,
+    data: &serde_json::Value,
+) -> Option<SubagentInfo> {
+    codex_subagent_info(agent_name, session_id, data)
+        .or_else(|| crate::providers::opencode::opencode_subagent_info(data))
 }
 
 fn apply_subagent_info(session: &mut SessionObject, info: Option<&SubagentInfo>) {
