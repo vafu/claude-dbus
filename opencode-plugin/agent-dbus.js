@@ -66,7 +66,7 @@ export const AgentDbus = async (ctx) => {
   function cached(sessionID) {
     let entry = meta.get(sessionID);
     if (!entry) {
-      entry = { model: "unknown", cwd: directory, title: "", costUsd: 0 };
+      entry = { model: "unknown", cwd: directory, title: "", costUsd: 0, sub: "" };
       meta.set(sessionID, entry);
     }
     return entry;
@@ -78,6 +78,7 @@ export const AgentDbus = async (ctx) => {
     if (patch.cwd) entry.cwd = patch.cwd;
     if (patch.title) entry.title = patch.title;
     if (typeof patch.costUsd === "number") entry.costUsd = patch.costUsd;
+    if (typeof patch.sub === "string") entry.sub = patch.sub;
   }
 
   function basePayload(sessionID, extra = {}) {
@@ -89,6 +90,12 @@ export const AgentDbus = async (ctx) => {
       session_title: entry.title,
       title: entry.title,
       cost: { total_cost_usd: entry.costUsd },
+      // Subagent sessions must keep identifying their parent on every event:
+      // the bridge drops window/app linkage for sessions with a parent, so a
+      // stale or missing parent here would let the sub shadow its parent.
+      ...(entry.sub
+        ? { parent_session_id: entry.sub, parentID: entry.sub }
+        : {}),
       ...extra,
     };
   }
@@ -282,15 +289,17 @@ export const AgentDbus = async (ctx) => {
         const info = props.info ?? props;
         const sessionID = props.sessionID ?? info.id ?? info.session_id;
         if (!sessionID) return;
+        const parentID = info.parentID ?? info.parentId ?? info.parent_id ?? "";
         remember(sessionID, {
           model: modelName(info.model) ?? "unknown",
           cwd: info.cwd ?? directory,
           title: info.title ?? "",
           costUsd: typeof info.cost === "number" ? info.cost : 0,
+          sub: parentID,
         });
         await fire("SessionStart", sessionID, {
-          parent_session_id: info.parentID ?? info.parentId ?? info.parent_id ?? "",
-          parentID: info.parentID ?? info.parentId ?? info.parent_id ?? "",
+          parent_session_id: parentID,
+          parentID,
         });
         return;
       }
@@ -303,6 +312,8 @@ export const AgentDbus = async (ctx) => {
         if (model) patch.model = model;
         if (typeof info.title === "string") patch.title = info.title;
         if (typeof info.cost === "number") patch.costUsd = info.cost;
+        const updatedParent = info.parentID ?? info.parentId ?? info.parent_id;
+        if (typeof updatedParent === "string" && updatedParent) patch.sub = updatedParent;
         remember(sessionID, patch);
         await fire("UpdateState", sessionID);
         return;

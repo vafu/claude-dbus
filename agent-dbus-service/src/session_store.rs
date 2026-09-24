@@ -60,10 +60,20 @@ pub(crate) async fn remove_session(
         window_id.as_deref(),
     )
     .await;
-    match conn.object_server().remove::<SessionObject, _>(&path).await {
-        Ok(_) => {}
-        Err(err) => warn!(%err, %session_id, "failed to remove session object"),
+    // Verify removal: hook connections race each other, and a concurrent
+    // creator must not silently win over this removal. Bounded retries keep
+    // a stuck object visible in the logs instead of lingering forever as a
+    // phantom session (and phantom badge count).
+    for _ in 0..3 {
+        match conn.object_server().remove::<SessionObject, _>(&path).await {
+            Ok(_) => {}
+            Err(err) => warn!(%err, %session_id, "failed to remove session object"),
+        }
+        if !crate::dbus::session_exists(conn, &path).await {
+            return;
+        }
     }
+    warn!(%session_id, "session object still present after repeated removal");
 }
 
 fn non_empty(value: &str) -> Option<&str> {

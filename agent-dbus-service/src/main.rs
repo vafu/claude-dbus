@@ -60,6 +60,11 @@ impl ExpiringSessionSet {
         self.entries.remove(key).is_some()
     }
 
+    pub fn contains(&mut self, key: &str) -> bool {
+        self.prune();
+        self.entries.contains_key(key)
+    }
+
     fn prune(&mut self) {
         let now = Instant::now();
         while let Some((key, inserted_at)) = self.order.front() {

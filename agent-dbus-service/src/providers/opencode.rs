@@ -40,7 +40,10 @@ fn is_always_allow_answer(answer: &str) -> bool {
 /// parent in `info.parentID`. The plugin flattens that into the hook data,
 /// accepting several aliases because the exact field name differs between the
 /// event payload and ad-hoc hook data.
-pub(crate) fn opencode_subagent_info(data: &serde_json::Value) -> Option<SubagentInfo> {
+pub(crate) fn opencode_subagent_info(
+    session_id: &str,
+    data: &serde_json::Value,
+) -> Option<SubagentInfo> {
     let parent_session_id = json_string_at(data, &["parent_session_id"])
         .or_else(|| json_string_at(data, &["parentID"]))
         .or_else(|| json_string_at(data, &["parentId"]))
@@ -49,7 +52,7 @@ pub(crate) fn opencode_subagent_info(data: &serde_json::Value) -> Option<Subagen
         .or_else(|| json_string_at(data, &["payload", "parent_session_id"]))
         .unwrap_or_default();
 
-    if parent_session_id.is_empty() {
+    if parent_session_id.is_empty() || parent_session_id == session_id {
         return None;
     }
 
@@ -107,21 +110,32 @@ mod tests {
 
     #[test]
     fn opencode_subagent_info_accepts_parent_aliases() {
-        let from_flat = opencode_subagent_info(&json!({ "parent_session_id": "ses_parent" }));
+        let from_flat =
+            opencode_subagent_info("ses_child", &json!({ "parent_session_id": "ses_parent" }));
         assert_eq!(
             from_flat.map(|info| info.parent_session_id),
             Some("ses_parent".to_string())
         );
 
-        let from_info = opencode_subagent_info(&json!({
-            "info": { "parentID": "ses_parent" }
-        }));
+        let from_info = opencode_subagent_info(
+            "ses_child",
+            &json!({
+                "info": { "parentID": "ses_parent" }
+            }),
+        );
         assert_eq!(
             from_info.map(|info| info.parent_session_id),
             Some("ses_parent".to_string())
         );
 
-        assert!(opencode_subagent_info(&json!({})).is_none());
-        assert!(opencode_subagent_info(&json!({ "parentID": "" })).is_none());
+        assert!(opencode_subagent_info("ses_child", &json!({})).is_none());
+        assert!(opencode_subagent_info("ses_child", &json!({ "parentID": "" })).is_none());
+    }
+
+    #[test]
+    fn opencode_subagent_info_rejects_self_parenting() {
+        assert!(
+            opencode_subagent_info("ses_1", &json!({ "parent_session_id": "ses_1" })).is_none()
+        );
     }
 }

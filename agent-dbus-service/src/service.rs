@@ -66,8 +66,26 @@ pub async fn handle_hook_connection(
     let event = hook.event.clone();
     let agent_name = hook.agent.clone();
     let session_id = hook.session_id.clone();
-    let app_instance_id = hook.app_instance_id.clone();
-    let window_id = hook.window_id.clone();
+    // Subagent sessions never own a window or app instance: they run inside
+    // their parent's context, and claiming transport metadata would shadow
+    // the parent's tile and locus relations (first match wins downstream).
+    // The stored lookup covers later hook events whose payload carries no
+    // lineage of its own.
+    let hook_subagent = hook_subagent_info(&agent_name, &session_id, data);
+    let stored_subagent = if hook_subagent.is_none() {
+        subagent_parent_session_id(&conn, &agent_name, &session_id).await
+    } else {
+        None
+    };
+    let (app_instance_id, window_id) = transport_metadata_for_hook(
+        hook_subagent.is_some() || stored_subagent.is_some(),
+        hook.app_instance_id.clone(),
+        hook.window_id.clone(),
+    );
+    // Mark subagent identity on any event carrying lineage, not just the
+    // branches below: hook bursts routinely interleave, and the creating
+    // event is not guaranteed to be the one holding the lineage.
+    ensure_subagent_identity(&conn, &agent_name, &session_id, hook_subagent.as_ref()).await;
     info!(agent = %agent_name, event = %event, session_id = %session_id, "hook received");
     tracing::debug!(data = %data, "hook data");
 
@@ -129,7 +147,16 @@ pub async fn handle_hook_connection(
         }
 
         "SessionStart" => {
-            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
+            // A start for an already-removed session id is a stale duplicate
+            // (ids are unique): processing it would resurrect the object.
+            if ended
+                .lock()
+                .await
+                .contains(&session_key(&agent_name, &session_id))
+            {
+                info!(session_id = %session_id, "skipping SessionStart for ended session");
+                return;
+            }
             let model = model_name(data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
@@ -143,7 +170,6 @@ pub async fn handle_hook_connection(
                     d.model_name = model.clone();
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
-                    apply_subagent_info(d, subagent_info.as_ref());
                     d.task_complete = false;
                     clear_pending_and_attention(d);
                 })
@@ -154,7 +180,18 @@ pub async fn handle_hook_connection(
         }
 
         "Stop" | "AfterAgent" => {
-            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
+            // Same duplicate protection as SessionStart: the first Stop
+            // already removed subagent sessions and settled top-level ones,
+            // so a second delivery must not recreate or re-mark anything.
+            if ended
+                .lock()
+                .await
+                .contains(&session_key(&agent_name, &session_id))
+            {
+                info!(session_id = %session_id, "skipping Stop for ended session");
+                return;
+            }
+            let subagent_info = hook_subagent.as_ref().cloned();
             let parent_session_id = if let Some(info) = subagent_info.as_ref() {
                 Some(info.parent_session_id.clone())
             } else {
@@ -209,7 +246,6 @@ pub async fn handle_hook_connection(
         }
 
         "UserPromptSubmit" | "BeforeAgent" | "BeforeModel" | "BeforeToolSelection" => {
-            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     apply_transport_metadata(
@@ -224,7 +260,6 @@ pub async fn handle_hook_connection(
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
-                    apply_subagent_info(d, subagent_info.as_ref());
                 })
                 .await,
                 "update_session",
@@ -299,7 +334,6 @@ pub async fn handle_hook_connection(
         }
 
         "PreToolUse" | "BeforeTool" => {
-            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     apply_transport_metadata(
@@ -312,7 +346,6 @@ pub async fn handle_hook_connection(
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
-                    apply_subagent_info(d, subagent_info.as_ref());
                 })
                 .await,
                 "update_session",
@@ -321,7 +354,6 @@ pub async fn handle_hook_connection(
         }
 
         "PostToolUse" | "AfterTool" => {
-            let subagent_info = hook_subagent_info(&agent_name, &session_id, data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
                     apply_transport_metadata(
@@ -348,7 +380,6 @@ pub async fn handle_hook_connection(
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
-                    apply_subagent_info(d, subagent_info.as_ref());
                 })
                 .await,
                 "update_session",
@@ -816,9 +847,25 @@ fn hook_subagent_info(
     data: &serde_json::Value,
 ) -> Option<SubagentInfo> {
     codex_subagent_info(agent_name, session_id, data)
-        .or_else(|| crate::providers::opencode::opencode_subagent_info(data))
+        .or_else(|| crate::providers::opencode::opencode_subagent_info(session_id, data))
 }
 
+/// Drops window/app-instance linkage for subagent sessions.
+///
+/// Subagents run inside their parent's context: letting them claim the
+/// terminal's transport metadata would shadow the parent session wherever
+/// the first match wins (window tiles, locus relations). The session id
+/// itself is always kept; only the linkage is dropped.
+fn transport_metadata_for_hook(
+    is_subagent: bool,
+    app_instance_id: Option<String>,
+    window_id: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match is_subagent {
+        true => (None, None),
+        false => (app_instance_id, window_id),
+    }
+}
 fn apply_subagent_info(session: &mut SessionObject, info: Option<&SubagentInfo>) {
     let Some(info) = info else {
         return;
@@ -827,6 +874,31 @@ fn apply_subagent_info(session: &mut SessionObject, info: Option<&SubagentInfo>)
     session.parent_session_id = info.parent_session_id.clone();
     session.agent_nickname = info.nickname.clone();
     session.agent_role = info.role.clone();
+}
+
+/// Records subagent identity outside any single event branch.
+///
+/// Hook events for one session routinely arrive as a burst (start, state,
+/// prompt, tool use within the same millisecond), and lineage may ride on
+/// any of them. Centralizing the marking here keeps it independent of
+/// branch handling and event order. No-op for top-level sessions.
+async fn ensure_subagent_identity(
+    conn: &zbus::Connection,
+    agent_name: &str,
+    session_id: &str,
+    info: Option<&SubagentInfo>,
+) {
+    let Some(info) = info else {
+        return;
+    };
+    log_zbus_result(
+        update_session(conn, agent_name, session_id, |d| {
+            apply_subagent_info(d, Some(info));
+        })
+        .await,
+        "update_session",
+        session_id,
+    );
 }
 
 fn apply_transport_metadata(
@@ -1627,6 +1699,26 @@ mod tests {
         });
 
         assert_eq!(subagent_info_from_value(&data), None);
+    }
+
+    #[test]
+    fn subagent_hooks_drop_window_linkage() {
+        assert_eq!(
+            transport_metadata_for_hook(
+                true,
+                Some("app-instance:1".to_string()),
+                Some("7".to_string()),
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            transport_metadata_for_hook(
+                false,
+                Some("app-instance:1".to_string()),
+                Some("7".to_string()),
+            ),
+            (Some("app-instance:1".to_string()), Some("7".to_string()))
+        );
     }
 
     #[test]

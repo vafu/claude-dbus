@@ -285,7 +285,10 @@ Approval behavior notes:
   answered in OpenCode's UI.
 - OpenCode subagent sessions carry a parent id, so they are tracked as
   subagents (`IsSubagent`, `ParentSessionId`) and removed on `Stop`, like
-  Codex subagents.
+  Codex subagents. Subagent sessions never claim window or app-instance
+  linkage: they run inside their parent's context, and claiming it would
+  shadow the parent wherever the first match wins. The plugin therefore
+  repeats the parent id on every hook payload for known subagents.
 
 When `agent-dbus` is not running (or `agent-hook` is missing), every plugin
 hook degrades to a silent no-op and OpenCode keeps working with its native

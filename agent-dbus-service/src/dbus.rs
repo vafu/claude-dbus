@@ -19,7 +19,10 @@ fn session_create_lock() -> &'static tokio::sync::Mutex<()> {
     SESSION_CREATE_LOCK.get_or_init(Default::default)
 }
 
-async fn session_exists(conn: &zbus::Connection, path: &zbus::zvariant::ObjectPath<'_>) -> bool {
+pub(crate) async fn session_exists(
+    conn: &zbus::Connection,
+    path: &zbus::zvariant::ObjectPath<'_>,
+) -> bool {
     conn.object_server()
         .interface::<_, SessionObject>(path)
         .await
