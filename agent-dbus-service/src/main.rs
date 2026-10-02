@@ -111,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_parents: SessionParents = Arc::new(Mutex::new(HashMap::new()));
     providers::codex::compact::start_codex_compact_watcher(conn.clone());
     providers::codex::title::start_codex_title_watcher(conn.clone());
+    providers::codex::telemetry::start(conn.clone());
     session_parents::start_parent_watcher(
         conn.clone(),
         Arc::clone(&ended),

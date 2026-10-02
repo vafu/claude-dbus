@@ -15,7 +15,11 @@ pub(crate) async fn update_session(
     session_id: &str,
     f: impl FnOnce(&mut SessionObject),
 ) -> zbus::Result<()> {
-    dbus::update_session(conn, agent_name, session_id, f).await
+    if agent_name == "codex" {
+        crate::providers::codex::telemetry::update_hook(conn, session_id, f).await
+    } else {
+        dbus::update_session(conn, agent_name, session_id, f).await
+    }
 }
 
 pub(crate) async fn update_existing_session(
@@ -34,6 +38,13 @@ pub(crate) async fn remove_session(
     agent_name: &str,
     session_id: &str,
 ) {
+    if agent_name == "codex" {
+        log_zbus_result(
+            crate::providers::codex::telemetry::drain(conn, session_id, true).await,
+            "drain final telemetry",
+            session_id,
+        );
+    }
     let key = session_key(agent_name, session_id);
     ended.lock().await.insert(key.clone());
     session_parents.lock().await.remove(&key);

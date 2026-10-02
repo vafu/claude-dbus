@@ -58,6 +58,11 @@ pub struct SessionObject {
     pub requires_attention: bool,
     pub context_pct: f64,
     pub model_name: String,
+    pub reasoning_effort: String,
+    pub token_usage: agent_dbus_core::telemetry::TokenUsage,
+    pub last_token_usage: agent_dbus_core::telemetry::TokenUsage,
+    pub usage_epoch: u64,
+    pub usage_revision: u64,
     pub cwd: String,
     pub cost_usd: f64,
     pub five_hour_usage_pct: f64,
@@ -85,6 +90,11 @@ struct SessionSnapshot {
     attention_reasons: Vec<String>,
     context_pct: f64,
     model_name: String,
+    reasoning_effort: String,
+    token_usage: agent_dbus_core::telemetry::TokenUsage,
+    last_token_usage: agent_dbus_core::telemetry::TokenUsage,
+    usage_epoch: u64,
+    usage_revision: u64,
     cwd: String,
     cost_usd: f64,
     five_hour_usage_pct: f64,
@@ -122,6 +132,11 @@ impl Default for SessionObject {
             requires_attention: false,
             context_pct: 0.0,
             model_name: String::new(),
+            reasoning_effort: "unknown".to_owned(),
+            token_usage: Default::default(),
+            last_token_usage: Default::default(),
+            usage_epoch: 0,
+            usage_revision: 0,
             cwd: String::new(),
             cost_usd: 0.0,
             five_hour_usage_pct: 0.0,
@@ -262,6 +277,11 @@ impl SessionObject {
                 .collect(),
             context_pct: self.context_pct,
             model_name: self.model_name.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            token_usage: self.token_usage.clone(),
+            last_token_usage: self.last_token_usage.clone(),
+            usage_epoch: self.usage_epoch,
+            usage_revision: self.usage_revision,
             cwd: self.cwd.clone(),
             cost_usd: self.cost_usd,
             five_hour_usage_pct: self.five_hour_usage_pct,
@@ -621,6 +641,21 @@ async fn emit_changed_properties(
     if before.model_name != after.model_name {
         iface.model_name_changed(emitter).await?;
     }
+    if before.reasoning_effort != after.reasoning_effort {
+        iface.reasoning_effort_changed(emitter).await?;
+    }
+    if before.token_usage != after.token_usage {
+        iface.token_usage_changed(emitter).await?;
+    }
+    if before.last_token_usage != after.last_token_usage {
+        iface.last_token_usage_changed(emitter).await?;
+    }
+    if before.usage_epoch != after.usage_epoch {
+        iface.usage_epoch_changed(emitter).await?;
+    }
+    if before.usage_revision != after.usage_revision {
+        iface.usage_revision_changed(emitter).await?;
+    }
     if before.cwd != after.cwd {
         iface.cwd_changed(emitter).await?;
     }
@@ -755,6 +790,31 @@ impl SessionObject {
     #[zbus(property)]
     fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    #[zbus(property)]
+    fn reasoning_effort(&self) -> &str {
+        &self.reasoning_effort
+    }
+
+    #[zbus(property)]
+    fn token_usage(&self) -> agent_dbus_core::telemetry::TokenUsage {
+        self.token_usage.clone()
+    }
+
+    #[zbus(property)]
+    fn last_token_usage(&self) -> agent_dbus_core::telemetry::TokenUsage {
+        self.last_token_usage.clone()
+    }
+
+    #[zbus(property)]
+    fn usage_epoch(&self) -> u64 {
+        self.usage_epoch
+    }
+
+    #[zbus(property)]
+    fn usage_revision(&self) -> u64 {
+        self.usage_revision
     }
 
     #[zbus(property)]
@@ -913,6 +973,12 @@ impl SessionObject {
 
     #[zbus(signal)]
     async fn notification(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    pub async fn token_usage_reported(
+        emitter: &SignalEmitter<'_>,
+        report: &agent_dbus_core::telemetry::UsageReport,
+    ) -> zbus::Result<()>;
 }
 
 pub async fn emit_notification(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()> {

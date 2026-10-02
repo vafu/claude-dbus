@@ -340,6 +340,11 @@ that must watch `PropertiesChanged`.
 | `AttentionReasons` | `as` | Active attention reason keys, including `pending-request`, `request-user-input`, `plan-mode-prompt`, `agent-turn-complete`, `tool-suggestion`, and native Codex approval aliases |
 | `ContextPct` | `d` | Context window usage percentage when supplied by input |
 | `ModelName` | `s` | Active model slug or display name |
+| `ReasoningEffort` | `s` | Selected effort: `unknown`, `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` |
+| `TokenUsage` | `a{st}` | Provider-reported cumulative session token counters; absent keys are unavailable |
+| `LastTokenUsage` | `a{st}` | Latest reported model-request counters, not a whole user turn |
+| `UsageEpoch` | `t` | Counter epoch; changes when the source resets or is replaced |
+| `UsageRevision` | `t` | Accepted usage observation revision within this exported session object |
 | `Cwd` | `s` | Working directory |
 | `CostUsd` | `d` | Total API cost when supplied by input |
 | `FiveHourUsagePct` | `d` | Current 5-hour usage percentage, when available |
@@ -375,6 +380,40 @@ that must watch `PropertiesChanged`.
 | `ElicitationRequestedWithDetails` | `sasas` | `prompt`, `options`, `option_descriptions` - includes per-option descriptions |
 | `ElicitationRequestedWithIdAndDetails` | `ssasas` | `request_id`, `prompt`, `options`, `option_descriptions` - id-aware signal with per-option descriptions |
 | `Notification` | `s` | `message` - notification from a compatible hook |
+| `TokenUsageReported` | `(ttssssa{st}a{st})` | Coherent usage report: epoch, revision, source RFC3339 timestamp, turn id, model, reasoning effort, delta counters, cumulative counters |
+
+### Reasoning and token telemetry
+
+The vocabulary is provider-neutral; currently only Codex implements it. Token
+maps use `input`, `output`, `cache_read_input`, `cache_write_input`,
+`reasoning_output`, and `total`. Counts are unsigned 64-bit integers. Missing
+keys mean unavailable; an explicit zero means the producer reported zero.
+Input includes cache reads/writes; output includes reasoning. These are
+overlapping totals and breakdowns: do not add cache or reasoning to `total`.
+Future provider adapters must normalize their accounting to this convention.
+
+Codex telemetry follows `turn_context` and `event_msg/token_count` records in
+its rollout under `$CODEX_HOME` (default `~/.codex`). An inotify-backed watcher
+reads complete appended JSONL records without a polling timer. Hooks reconcile
+the same reader before updates and session removal. Partial lines are retained,
+and replacement/truncation establishes a new epoch and historical baseline.
+Telemetry updates metadata only; it never changes lifecycle state or creates
+objects for sessions that have ended.
+
+Initial history populates properties without replaying consumption signals.
+Repeated cumulative snapshots and rate-limit-only events do not produce usage
+increments. A counter decrease establishes a new baseline with an empty delta;
+synthetic context-full records whose totals do not equal input plus output are
+excluded. Newly appearing optional breakdowns are baselined rather than
+backfilled. Session totals are the producer's totals, including resumed history;
+consumers should baseline snapshots and use live deltas for time-range metrics.
+Root and subagent usage remain separate, without adding children to their parent.
+
+`TokenUsageReported` carries the model and effort associated with that record,
+so clients need not join independent property notifications. The latest
+properties support discovery and reconnect baselines; signals are live events,
+not a durable replay log. Reasoning effort is selected configuration, not a
+measurement of reasoning duration. Unavailable metadata is `unknown`.
 
 ### Introspect
 

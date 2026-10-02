@@ -50,13 +50,17 @@ impl<T: Clone> BoundedCache<T> {
 }
 
 pub(crate) fn codex_log_file() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".codex/log/codex-tui.log"))
+    Some(codex_home()?.join("log/codex-tui.log"))
+}
+
+pub(crate) fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".codex")))
 }
 
 pub(crate) fn codex_session_index_file() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".codex/session_index.jsonl"))
+    Some(codex_home()?.join("session_index.jsonl"))
 }
 
 pub(crate) fn codex_session_file(session_id: &str) -> Option<PathBuf> {
@@ -71,8 +75,7 @@ pub(crate) fn codex_session_file(session_id: &str) -> Option<PathBuf> {
         cache.remove(session_id);
     }
 
-    let home = std::env::var_os("HOME")?;
-    let sessions_dir = Path::new(&home).join(".codex/sessions");
+    let sessions_dir = codex_home()?.join("sessions");
     let mut matches = Vec::new();
     collect_matching_codex_sessions(&sessions_dir, session_id, &mut matches);
     let path = matches.into_iter().max_by_key(|path| {
