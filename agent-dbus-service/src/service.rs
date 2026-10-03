@@ -66,6 +66,15 @@ pub async fn handle_hook_connection(
     let event = hook.event.clone();
     let agent_name = hook.agent.clone();
     let session_id = hook.session_id.clone();
+    // Late telemetry must not recreate closed children or sessions.
+    if event == "Telemetry"
+        && ended
+            .lock()
+            .await
+            .contains(&session_key(&agent_name, &session_id))
+    {
+        return;
+    }
     // Subagent sessions never own a window or app instance: they run inside
     // their parent's context, and claiming transport metadata would shadow
     // the parent's tile and locus relations (first match wins downstream).
@@ -102,6 +111,40 @@ pub async fn handle_hook_connection(
     maybe_watch_parent(&session_parents, &agent_name, &session_id, hook.parent_pid).await;
 
     match event.as_str() {
+        "Telemetry" if agent_dbus_core::agent::is_opencode_agent(&agent_name) => {
+            let mut report = None;
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
+                    if let Some(cwd) = data["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
+                        d.cwd = cwd.to_owned();
+                    }
+                    report = crate::providers::opencode::apply_telemetry(d, data);
+                })
+                .await,
+                "opencode telemetry",
+                &session_id,
+            );
+            if let Some(report) = report {
+                let path = session_path(&agent_name, &session_id);
+                if let Ok(iface) = conn
+                    .object_server()
+                    .interface::<_, SessionObject>(&path)
+                    .await
+                {
+                    log_zbus_result(
+                        SessionObject::token_usage_reported(iface.signal_emitter(), &report).await,
+                        "emit opencode usage",
+                        &session_id,
+                    );
+                }
+            }
+        }
         "UpdateState" => {
             if ended
                 .lock()

@@ -23,6 +23,8 @@
 //   experimental.session.compacting      -> PreCompact (compacting)
 //   session.compacted                    -> UpdateState (idle)
 //   session.updated                      -> UpdateState (title/model/cost sync)
+//   chat.headers                         -> Telemetry (effective reasoning effort)
+//   message.part.updated (step-finish)    -> Telemetry (normalized token usage)
 //   session.error                        -> Notification
 //   permission.asked                     -> PermissionRequest (blocking) + reply
 //   question.asked                       -> AttentionRequired (reason: question)
@@ -62,11 +64,16 @@ export const AgentDbus = async (ctx) => {
   // Per-session metadata so metadata-only updates (session.updated) can
   // re-send a complete, side-effect-free UpdateState.
   const meta = new Map();
+  const attachedAt = Date.now();
 
   function cached(sessionID) {
     let entry = meta.get(sessionID);
     if (!entry) {
-      entry = { model: "unknown", cwd: directory, title: "", costUsd: 0, sub: "" };
+      entry = {
+        model: "unknown", cwd: directory, title: "", costUsd: 0, sub: "", effort: "unknown",
+        baseline: {}, totals: {}, seed: undefined, delivery: Promise.resolve(), events: Promise.resolve(),
+        messages: new Map(), messageRequests: new Map(), steps: new Set(), ended: false,
+      };
       meta.set(sessionID, entry);
     }
     return entry;
@@ -79,6 +86,7 @@ export const AgentDbus = async (ctx) => {
     if (patch.title) entry.title = patch.title;
     if (typeof patch.costUsd === "number") entry.costUsd = patch.costUsd;
     if (typeof patch.sub === "string") entry.sub = patch.sub;
+    if (typeof patch.effort === "string") entry.effort = patch.effort;
   }
 
   function basePayload(sessionID, extra = {}) {
@@ -87,6 +95,8 @@ export const AgentDbus = async (ctx) => {
       session_id: sessionID,
       cwd: entry.cwd || directory,
       model: entry.model,
+      reasoning_effort: entry.effort,
+      usage_baseline: entry.baseline,
       session_title: entry.title,
       title: entry.title,
       cost: { total_cost_usd: entry.costUsd },
@@ -142,7 +152,70 @@ export const AgentDbus = async (ctx) => {
 
   function fire(event, sessionID, extra = {}) {
     if (!sessionID) return Promise.resolve("");
-    return runHook(event, basePayload(sessionID, extra)).catch(() => "");
+    const entry = cached(sessionID);
+    // Preserve usage-before-Stop ordering and serialize passive socket writes.
+    entry.delivery = entry.delivery.catch(() => "").then(async () => {
+      await seed(sessionID);
+      return runHook(event, basePayload(sessionID, extra)).catch(() => "");
+    });
+    return entry.delivery;
+  }
+
+  async function seed(sessionID) {
+    const entry = cached(sessionID);
+    if (!entry.seed) entry.seed = (async () => {
+      if (!serverUrl) return;
+      try {
+        const headers = directory ? { "x-opencode-directory": encodeURIComponent(directory) } : {};
+        // One discovery snapshot, not polling. Use the live listener rather
+        // than the SDK's potentially different in-process service instance.
+        const res = await fetch(new URL(`/session/${encodeURIComponent(sessionID)}`, serverUrl), {
+          headers, signal: AbortSignal.timeout(FAST_TIMEOUT_MS),
+        });
+        if (!res.ok) return;
+        const info = await res.json();
+        const baseline = normalizeTokens(info.tokens);
+        if (baseline) { entry.baseline = baseline; entry.totals = { ...baseline }; }
+        if (typeof info.parentID === "string") entry.sub = info.parentID;
+        if (typeof info.directory === "string") entry.cwd = info.directory;
+      } catch {}
+    })();
+    await entry.seed;
+  }
+
+  async function finishStep(props) {
+    const part = props.part;
+    if (part?.type !== "step-finish" || !part.id || !part.sessionID) return;
+    const entry = cached(part.sessionID);
+    if (entry.ended || entry.steps.has(part.id)) return;
+    const usage = normalizeTokens(part.tokens);
+    if (!usage) return;
+    const message = entry.messages.get(part.messageID);
+    // Imported/forked historical parts are not new consumption.
+    if (message?.time?.completed < attachedAt) return;
+    await seed(part.sessionID);
+    const request = entry.messageRequests.get(part.messageID);
+    // A fork/import can replay recent historical steps with new IDs. Only a
+    // model request actually observed in this session can produce live usage.
+    if (!request) return;
+    const model = message?.modelID ?? request?.model ?? "unknown";
+    const effort = request?.effort ?? "unknown";
+    const totals = { ...entry.totals };
+    for (const [key, value] of Object.entries(usage)) {
+      const total = (totals[key] ?? 0) + value;
+      if (!Number.isSafeInteger(total)) return;
+      totals[key] = total;
+    }
+    entry.steps.add(part.id);
+    if (entry.steps.size > 4096) entry.steps.delete(entry.steps.values().next().value);
+    entry.totals = totals;
+    await fire("Telemetry", part.sessionID, {
+      usage_event_id: part.id,
+      usage_timestamp: new Date(Number.isFinite(props.time) ? props.time : Date.now()).toISOString(),
+      turn_id: message?.parentID ?? "",
+      model, reasoning_effort: effort,
+      token_usage: usage, cumulative_token_usage: totals,
+    });
   }
 
   async function replyPermission(sessionID, requestID, reply) {
@@ -204,13 +277,35 @@ export const AgentDbus = async (ctx) => {
       } catch {}
     },
 
-    "chat.params": async (input) => {
+    "chat.params": async (input, output) => {
       try {
         const sessionID = input.sessionID ?? input.session_id;
         if (!sessionID) return;
         const model = modelName(input.model);
         if (model) remember(sessionID, { model });
+        const entry = cached(sessionID);
+        entry.request = { model, parent: input.message?.id, provider: input.model?.providerID, options: output?.options ?? {} };
+        remember(sessionID, { effort: effortFromOptions(entry.request.options) });
         await fire("BeforeModel", sessionID);
+      } catch {}
+    },
+
+    "chat.headers": async (input) => {
+      try {
+        const sessionID = input.sessionID ?? input.session_id;
+        if (!sessionID) return;
+        const entry = cached(sessionID);
+        const request = entry.request;
+        if (!request) return;
+        // chat.params output is mutable; read after all params hooks completed.
+        const effort = effortFromOptions(request.options);
+        remember(sessionID, { effort });
+        entry.currentContext = { model: request.model, parent: request.parent, provider: request.provider, effort };
+        const message = entry.messages.get(entry.activeMessage);
+        if (message && requestKey(message.parentID, message.modelID, message.providerID) === requestKey(request.parent, request.model, request.provider)) {
+          boundedSet(entry.messageRequests, message.id, entry.currentContext);
+        }
+        await fire("Telemetry", sessionID);
       } catch {}
     },
 
@@ -240,7 +335,7 @@ export const AgentDbus = async (ctx) => {
       try {
         const sessionID = input.sessionID ?? input.session_id;
         if (!sessionID) return;
-        await runHook("PreCompact", { session_id: sessionID }).catch(() => "");
+        await fire("PreCompact", sessionID);
       } catch {}
     },
 
@@ -276,7 +371,15 @@ export const AgentDbus = async (ctx) => {
 
     event: async ({ event }) => {
       try {
-        await handleEvent(event);
+        const props = event?.properties ?? {};
+        const sessionID = props.sessionID ?? props.session_id ?? props.part?.sessionID ?? props.info?.sessionID ?? (event?.type?.startsWith("session.") ? props.info?.id : undefined);
+        if (!sessionID || event?.type?.startsWith("permission.")) {
+          await handleEvent(event);
+          return;
+        }
+        const entry = cached(sessionID);
+        entry.events = entry.events.catch(() => {}).then(() => handleEvent(event));
+        await entry.events;
       } catch {}
     },
   };
@@ -297,6 +400,11 @@ export const AgentDbus = async (ctx) => {
           costUsd: typeof info.cost === "number" ? info.cost : 0,
           sub: parentID,
         });
+        const entry = cached(sessionID);
+        const baseline = normalizeTokens(info.tokens);
+        if (baseline) {
+          entry.baseline = baseline; entry.totals = { ...baseline }; entry.seed = Promise.resolve();
+        }
         await fire("SessionStart", sessionID, {
           parent_session_id: parentID,
           parentID,
@@ -322,7 +430,10 @@ export const AgentDbus = async (ctx) => {
         const sessionID = props.sessionID ?? props.session_id;
         if (!sessionID) return;
         const status = typeof props.status === "string" ? props.status : props.status?.type;
-        if (status === "idle") await fire("Stop", sessionID);
+        if (status === "idle") {
+          await fire("Stop", sessionID);
+          if (cached(sessionID).sub) cached(sessionID).ended = true;
+        }
         else if (status === "busy" || status === "retry")
           await fire("UpdateState", sessionID, { state: "thinking" });
         return;
@@ -331,13 +442,16 @@ export const AgentDbus = async (ctx) => {
         const sessionID = props.sessionID ?? props.session_id;
         if (!sessionID) return;
         await fire("Stop", sessionID);
+        if (cached(sessionID).sub) cached(sessionID).ended = true;
         return;
       }
       case "session.deleted": {
         const sessionID = props.sessionID ?? props.info?.id ?? props.session_id;
         if (!sessionID) return;
-        await runHook("SessionEnd", { session_id: sessionID }).catch(() => "");
-        meta.delete(sessionID);
+        const entry = cached(sessionID);
+        entry.ended = true;
+        await fire("SessionEnd", sessionID);
+        entry.messages.clear(); entry.messageRequests.clear(); entry.steps.clear();
         return;
       }
       case "session.compacted": {
@@ -369,6 +483,20 @@ export const AgentDbus = async (ctx) => {
         const cwd = props.info?.path?.cwd ?? props.path?.cwd;
         const sessionID = props.sessionID ?? props.session_id ?? props.info?.sessionID;
         if (sessionID && typeof cwd === "string" && cwd) remember(sessionID, { cwd });
+        if (sessionID && props.info?.role === "assistant" && props.info.id) {
+          const entry = cached(sessionID);
+          boundedSet(entry.messages, props.info.id, props.info);
+          if (!props.info.time?.completed && !props.info.finish) entry.activeMessage = props.info.id;
+          const context = entry.currentContext;
+          if (context && !entry.messageRequests.has(props.info.id)
+            && requestKey(props.info.parentID, props.info.modelID, props.info.providerID) === requestKey(context.parent, context.model, context.provider)) {
+            boundedSet(entry.messageRequests, props.info.id, context);
+          }
+        }
+        return;
+      }
+      case "message.part.updated": {
+        await finishStep(props);
         return;
       }
       case "question.asked": {
@@ -386,6 +514,38 @@ export const AgentDbus = async (ctx) => {
     }
   }
 };
+
+function requestKey(parent, model, provider) {
+  return JSON.stringify([parent ?? "", model ?? "", provider ?? ""]);
+}
+
+function boundedSet(map, key, value) {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > 1024) map.delete(map.keys().next().value);
+}
+
+function effortFromOptions(options) {
+  const value = options.reasoningEffort ?? options.reasoning_effort ?? options.effort
+    ?? options.thinkingLevel ?? options.thinkingConfig?.thinkingLevel;
+  const effort = typeof value === "string" ? value.toLowerCase() : "unknown";
+  if (["none", "minimal", "low", "medium", "high", "xhigh"].includes(effort)) return effort;
+  if (options.thinking?.type === "disabled") return "none";
+  // Budget-only thinking settings and arbitrary variants aren't effort levels.
+  return "unknown";
+}
+
+function normalizeTokens(tokens) {
+  if (!tokens) return;
+  const values = [tokens.input, tokens.output, tokens.reasoning, tokens.cache?.read, tokens.cache?.write];
+  if (!values.every((v) => Number.isSafeInteger(v) && v >= 0)) return;
+  const input = tokens.input + tokens.cache.read + tokens.cache.write;
+  const output = tokens.output + tokens.reasoning;
+  const total = input + output;
+  if (![input, output, total].every(Number.isSafeInteger)) return;
+  return { input, output, cache_read_input: tokens.cache.read, cache_write_input: tokens.cache.write,
+    reasoning_output: tokens.reasoning, total };
+}
 
 function modelName(model) {
   if (!model) return "";

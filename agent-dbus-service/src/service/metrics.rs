@@ -7,6 +7,9 @@ pub(super) fn apply_usage_limits(
     session_id: &str,
     data: &serde_json::Value,
 ) {
+    if agent_dbus_core::agent::is_opencode_agent(agent_name) && data.get("token_usage").is_none() {
+        crate::providers::opencode::apply_telemetry(session, data);
+    }
     let fallback = if agent_name == "codex" {
         codex_session_metrics(session_id)
     } else {

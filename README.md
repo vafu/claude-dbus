@@ -258,6 +258,8 @@ agents use:
 | `session.created` | `SessionStart` |
 | `chat.message` | `UserPromptSubmit` (thinking) |
 | `chat.params` | `BeforeModel` (thinking + model) |
+| `chat.headers` | `Telemetry` (effective reasoning effort after params hooks) |
+| `message.part.updated` / `step-finish` | `Telemetry` (normalized per-request token consumption) |
 | `tool.execute.before` | `PreToolUse` (tool-use) |
 | `tool.execute.after` | `PostToolUse` (thinking) |
 | `session.status` idle / `session.idle` | `Stop` (idle + task complete) |
@@ -384,7 +386,7 @@ that must watch `PropertiesChanged`.
 
 ### Reasoning and token telemetry
 
-The vocabulary is provider-neutral; currently only Codex implements it. Token
+The vocabulary is provider-neutral; Codex and OpenCode implement it. Token
 maps use `input`, `output`, `cache_read_input`, `cache_write_input`,
 `reasoning_output`, and `total`. Counts are unsigned 64-bit integers. Missing
 keys mean unavailable; an explicit zero means the producer reported zero.
@@ -414,6 +416,35 @@ so clients need not join independent property notifications. The latest
 properties support discovery and reconnect baselines; signals are live events,
 not a durable replay log. Reasoning effort is selected configuration, not a
 measurement of reasoning duration. Unavailable metadata is `unknown`.
+
+OpenCode's plugin forwards unique `step-finish` parts, not assistant message
+snapshots (which repeat usage) or streaming text/reasoning deltas. Its native
+input bucket excludes cache reads/writes and its output bucket excludes
+reasoning. The plugin adds those buckets back to produce the same inclusive
+`input`, `output`, and `total` used by Codex. It validates nonnegative safe
+integers; unavailable/incomplete usage is not synthesized as zero.
+
+Reasoning effort comes from effective `chat.params` options, read again in
+`chat.headers` after other params hooks have run. Arbitrary variant labels and
+budget-only thinking configurations remain `unknown`. Each usage report uses
+its assistant message's model and corresponding request context, independently
+of the session's currently selected model. A single read of the live session
+HTTP endpoint baselines resumed cumulative counters when available; historical
+imports/forks are not emitted as new usage. Older OpenCode versions without
+session-level counters expose totals for observed steps only.
+
+Passive events and socket writes are serialized per session, preserving final
+child usage before `Stop`. Duplicate step IDs are retained in a bounded
+4096-event window by both plugin and bridge. Closed-session telemetry is ignored.
+Bridge reconnects receive cumulative snapshots without replaying them as live
+consumption. The plugin is loaded at OpenCode startup: after replacing it, quit
+and restart OpenCode to enable the new hooks.
+
+Plugin verification (no extra dependencies):
+
+```sh
+node --test opencode-plugin/agent-dbus.test.mjs
+```
 
 ### Introspect
 
