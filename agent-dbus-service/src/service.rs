@@ -18,6 +18,7 @@ use crate::session_store::{
 use crate::socket::read_raw_hook;
 use crate::types::SessionState;
 use crate::{EndedSessions, SessionParents};
+use agent_dbus_core::constants::APPROVAL_UI_BUS_NAME;
 use agent_dbus_core::path::{session_key, session_path};
 
 mod metrics;
@@ -484,6 +485,18 @@ pub async fn handle_hook_connection(
             );
             if should_defer_codex_permission_to_auto_review(&agent_name, data) {
                 info!(agent = %agent_name, session_id = %session_id, "deferred codex permission request to auto-review");
+                return;
+            }
+            if !approval_ui_attached(&conn).await {
+                // Nothing on the bus can answer a blocking request right now.
+                // Returning without a decision makes Codex (and Claude) fall
+                // back to their own native approval prompt instead of sitting
+                // in "running hook" until the elicitation times out.
+                info!(
+                    agent = %agent_name,
+                    session_id = %session_id,
+                    "no approval UI attached; leaving permission prompt to the agent"
+                );
                 return;
             }
             let options = build_permission_options(data);
@@ -1149,6 +1162,23 @@ async fn handle_elicitation_event(
     answer
 }
 
+/// Whether a client able to answer blocking approval requests is on the bus.
+///
+/// Approval requests are blocking hooks: while one is pending the agent waits
+/// on `RespondToElicitation` and suppresses its own prompt. If no UI owns
+/// [`APPROVAL_UI_BUS_NAME`], nothing will ever answer, so the bridge must not
+/// claim the prompt. A failed check is treated as "not attached" so an agent
+/// is never left stuck behind a broken presence lookup.
+async fn approval_ui_attached(conn: &zbus::Connection) -> bool {
+    let Ok(proxy) = zbus::fdo::DBusProxy::new(conn).await else {
+        return false;
+    };
+    let Ok(name) = zbus::names::BusName::try_from(APPROVAL_UI_BUS_NAME) else {
+        return false;
+    };
+    proxy.name_has_owner(name).await.unwrap_or(false)
+}
+
 fn elicitation_timeout() -> Duration {
     std::env::var("AGENT_DBUS_ELICITATION_TIMEOUT_SECS")
         .ok()
@@ -1240,6 +1270,11 @@ mod tests {
             parse_codex_thread_title_json(output),
             Some("first line\nsecond line".to_string())
         );
+    }
+
+    #[test]
+    fn approval_ui_bus_name_is_a_valid_well_known_name() {
+        assert!(zbus::names::BusName::try_from(APPROVAL_UI_BUS_NAME).is_ok());
     }
 
     #[test]
