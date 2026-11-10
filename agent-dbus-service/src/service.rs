@@ -67,14 +67,19 @@ pub async fn handle_hook_connection(
     let event = hook.event.clone();
     let agent_name = hook.agent.clone();
     let session_id = hook.session_id.clone();
-    // Late telemetry must not recreate closed children or sessions.
-    if event == "Telemetry"
-        && ended
-            .lock()
-            .await
-            .contains(&session_key(&agent_name, &session_id))
-    {
-        return;
+    // Ended sessions must not be recreated by late hooks. `/clear` leaves the
+    // previous session's hooks running in the same terminal, so stale tool
+    // traffic would otherwise resurrect it and re-claim the window relation.
+    // `codex resume` intentionally reuses a session id; its SessionStart
+    // carries source=resume and reopens the session.
+    let session_key_value = session_key(&agent_name, &session_id);
+    if ended.lock().await.contains(&session_key_value) {
+        let resumes = event == "SessionStart" && data["source"].as_str() == Some("resume");
+        if !resumes {
+            info!(agent = %agent_name, event = %event, session_id = %session_id, "skipping hook for ended session");
+            return;
+        }
+        ended.lock().await.remove(&session_key_value);
     }
     // Subagent sessions never own a window or app instance: they run inside
     // their parent's context, and claiming transport metadata would shadow
@@ -191,16 +196,16 @@ pub async fn handle_hook_connection(
         }
 
         "SessionStart" => {
-            // A start for an already-removed session id is a stale duplicate
-            // (ids are unique): processing it would resurrect the object.
-            if ended
-                .lock()
-                .await
-                .contains(&session_key(&agent_name, &session_id))
-            {
-                info!(session_id = %session_id, "skipping SessionStart for ended session");
-                return;
-            }
+            supersede_stale_sessions(
+                &conn,
+                &ended,
+                &session_parents,
+                &agent_name,
+                &session_id,
+                app_instance_id.as_deref(),
+                window_id.as_deref(),
+            )
+            .await;
             let model = model_name(data);
             log_zbus_result(
                 update_session(&conn, &agent_name, &session_id, |d| {
@@ -227,14 +232,6 @@ pub async fn handle_hook_connection(
             // Same duplicate protection as SessionStart: the first Stop
             // already removed subagent sessions and settled top-level ones,
             // so a second delivery must not recreate or re-mark anything.
-            if ended
-                .lock()
-                .await
-                .contains(&session_key(&agent_name, &session_id))
-            {
-                info!(session_id = %session_id, "skipping Stop for ended session");
-                return;
-            }
             let subagent_info = hook_subagent.as_ref().cloned();
             let parent_session_id = if let Some(info) = subagent_info.as_ref() {
                 Some(info.parent_session_id.clone())
@@ -269,6 +266,29 @@ pub async fn handle_hook_connection(
 
         "SessionEnd" => {
             remove_session(&conn, &ended, &session_parents, &agent_name, &session_id).await;
+        }
+
+        "Interrupt" => {
+            // A cancelled turn does not emit Stop, so without this the session
+            // stays thinking/tool-use until the next prompt.
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
+                    mark_turn_complete(d);
+                    clear_pending_and_attention(d);
+                    d.model_name = model_name(data);
+                    d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
+                    apply_usage_limits(d, &agent_name, &session_id, data);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
         }
 
         "TaskCompleted" => {
@@ -387,6 +407,9 @@ pub async fn handle_hook_connection(
                         window_id.as_deref(),
                     );
                     d.state = SessionState::ToolUse;
+                    if is_user_input_tool(data) {
+                        d.set_attention_reason("request-user-input");
+                    }
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -459,6 +482,28 @@ pub async fn handle_hook_connection(
                     );
                     d.state = SessionState::Compacting;
                     clear_pending_and_attention(d);
+                })
+                .await,
+                "update_session",
+                &session_id,
+            );
+        }
+
+        "PostCompact" | "PostCompress" => {
+            log_zbus_result(
+                update_session(&conn, &agent_name, &session_id, |d| {
+                    apply_transport_metadata(
+                        d,
+                        &session_id,
+                        app_instance_id.as_deref(),
+                        window_id.as_deref(),
+                    );
+                    if d.state == SessionState::Compacting {
+                        // PostCompact fires inside the turn; the agent resumes
+                        // working unless a later Stop/Interrupt ends it.
+                        d.state = SessionState::Thinking;
+                        d.task_complete = false;
+                    }
                 })
                 .await,
                 "update_session",
@@ -817,6 +862,34 @@ async fn apply_attention_event(
         "update_session",
         session_id,
     );
+}
+
+/// Removes sessions replaced by a new one on the same transport.
+///
+/// `/clear` opens a fresh session in the same terminal without ending the old
+/// one. Keeping both live makes the old object keep reclaiming the window and
+/// app-instance relations whenever late hooks arrive.
+async fn supersede_stale_sessions(
+    conn: &zbus::Connection,
+    ended: &EndedSessions,
+    session_parents: &SessionParents,
+    agent_name: &str,
+    session_id: &str,
+    app_instance_id: Option<&str>,
+    window_id: Option<&str>,
+) {
+    let replaced =
+        crate::dbus::superseded_sessions(conn, agent_name, session_id, app_instance_id, window_id)
+            .await;
+    for (old_agent, old_session) in replaced {
+        info!(
+            agent = %old_agent,
+            session_id = %old_session,
+            replaced_by = %session_id,
+            "superseding stale session on the same window"
+        );
+        remove_session(conn, ended, session_parents, &old_agent, &old_session).await;
+    }
 }
 
 async fn clear_attention_event(
@@ -1224,6 +1297,17 @@ fn apply_nonblocking_attention(
 
 fn hook_tool_name(data: &serde_json::Value) -> String {
     data["tool_name"].as_str().unwrap_or("").to_string()
+}
+
+fn is_user_input_tool(data: &serde_json::Value) -> bool {
+    matches!(
+        hook_tool_name(data)
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str(),
+        "request_user_input" | "ask_user_question"
+    )
 }
 
 fn attention_reason(data: &serde_json::Value) -> String {
@@ -1848,6 +1932,32 @@ mod tests {
 
         session.clear_attention_reason("request-user-input");
 
+        assert!(!session.requires_attention);
+    }
+
+    #[test]
+    fn recognizes_user_input_tool_names() {
+        assert!(is_user_input_tool(&json!({
+            "tool_name": "request_user_input"
+        })));
+        assert!(is_user_input_tool(&json!({
+            "tool_name": " Ask-User-Question "
+        })));
+        assert!(!is_user_input_tool(&json!({ "tool_name": "Bash" })));
+        assert!(!is_user_input_tool(&json!({})));
+    }
+
+    #[test]
+    fn interrupt_settles_a_tool_use_session() {
+        let mut session = SessionObject::new("codex", "session-1");
+        session.state = SessionState::ToolUse;
+        session.set_attention_reason("request-user-input");
+
+        mark_turn_complete(&mut session);
+        clear_pending_and_attention(&mut session);
+
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.task_complete);
         assert!(!session.requires_attention);
     }
 

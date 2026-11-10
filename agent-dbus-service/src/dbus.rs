@@ -1,14 +1,110 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::OnceLock;
 
 use tracing::{debug, warn};
+use zbus::names::OwnedInterfaceName;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::request_broker::global_request_broker;
 use crate::types::SessionState;
+use agent_dbus_core::constants::{BUS_NAME, ROOT_PATH, SESSION_INTERFACE};
 use agent_dbus_core::path::session_path;
 
 const MAX_PENDING_REQUESTS_PER_SESSION: usize = 4;
+const OBJECT_MANAGER_INTERFACE: &str = "org.freedesktop.DBus.ObjectManager";
+
+type ManagedObjects =
+    HashMap<OwnedObjectPath, HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionOrigin {
+    agent_name: String,
+    session_id: String,
+    app_instance_id: String,
+    window_id: String,
+    is_subagent: bool,
+}
+
+/// Lists live top-level sessions this new session supersedes.
+///
+/// `/clear` starts a fresh session in the same terminal without ending the old
+/// one, so the old object can keep re-claiming the window/app-instance
+/// relation. A new top-level session on the same transport replaces those.
+pub(crate) async fn superseded_sessions(
+    conn: &zbus::Connection,
+    agent_name: &str,
+    session_id: &str,
+    app_instance_id: Option<&str>,
+    window_id: Option<&str>,
+) -> Vec<(String, String)> {
+    let Ok(origins) = live_session_origins(conn).await else {
+        return Vec::new();
+    };
+    superseded_origins(&origins, agent_name, session_id, app_instance_id, window_id)
+}
+
+fn superseded_origins(
+    origins: &[SessionOrigin],
+    agent_name: &str,
+    session_id: &str,
+    app_instance_id: Option<&str>,
+    window_id: Option<&str>,
+) -> Vec<(String, String)> {
+    if app_instance_id.is_none() && window_id.is_none() {
+        return Vec::new();
+    }
+    origins
+        .iter()
+        .filter(|origin| !origin.is_subagent)
+        .filter(|origin| origin.agent_name != agent_name || origin.session_id != session_id)
+        .filter(|origin| transport_matches(origin, app_instance_id, window_id))
+        .map(|origin| (origin.agent_name.clone(), origin.session_id.clone()))
+        .collect()
+}
+
+fn transport_matches(
+    origin: &SessionOrigin,
+    app_instance_id: Option<&str>,
+    window_id: Option<&str>,
+) -> bool {
+    let app_matches = app_instance_id
+        .is_none_or(|app| !origin.app_instance_id.is_empty() && origin.app_instance_id == app);
+    let window_matches =
+        window_id.is_none_or(|window| !origin.window_id.is_empty() && origin.window_id == window);
+    app_matches && window_matches
+}
+
+async fn live_session_origins(conn: &zbus::Connection) -> zbus::Result<Vec<SessionOrigin>> {
+    let proxy = zbus::Proxy::new(conn, BUS_NAME, ROOT_PATH, OBJECT_MANAGER_INTERFACE).await?;
+    let objects: ManagedObjects = proxy.call("GetManagedObjects", &()).await?;
+    Ok(objects
+        .into_values()
+        .filter_map(|interfaces| {
+            interfaces
+                .into_iter()
+                .find(|(interface, _)| interface.as_str() == SESSION_INTERFACE)
+                .map(|(_, properties)| properties)
+        })
+        .filter_map(|properties| {
+            Some(SessionOrigin {
+                agent_name: managed_string(&properties, "AgentName")?,
+                session_id: managed_string(&properties, "SessionId")?,
+                app_instance_id: managed_string(&properties, "AppInstanceId").unwrap_or_default(),
+                window_id: managed_string(&properties, "WindowId").unwrap_or_default(),
+                is_subagent: managed_bool(&properties, "IsSubagent").unwrap_or(false),
+            })
+        })
+        .collect())
+}
+
+fn managed_string(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<String> {
+    String::try_from(properties.get(name)?.clone()).ok()
+}
+
+fn managed_bool(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<bool> {
+    bool::try_from(properties.get(name)?.clone()).ok()
+}
 
 /// Serialises the "does this session object exist yet, and if not publish it"
 /// step. Hook connections are handled concurrently, so without this two hooks
@@ -1127,4 +1223,76 @@ pub async fn update_existing_session(
     let iface = iface_ref.get().await;
     emit_changed_properties(&iface, emitter, &before, &after).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod supersession_tests {
+    use super::*;
+
+    fn origin(agent: &str, session: &str, app: &str, window: &str) -> SessionOrigin {
+        SessionOrigin {
+            agent_name: agent.to_owned(),
+            session_id: session.to_owned(),
+            app_instance_id: app.to_owned(),
+            window_id: window.to_owned(),
+            is_subagent: false,
+        }
+    }
+
+    #[test]
+    fn supersedes_previous_session_on_the_same_window() {
+        let origins = vec![
+            origin("codex", "old", "app-1", "window-1"),
+            origin("codex", "other-window", "app-2", "window-2"),
+        ];
+
+        assert_eq!(
+            superseded_origins(&origins, "codex", "new", Some("app-1"), Some("window-1")),
+            vec![("codex".to_owned(), "old".to_owned())]
+        );
+    }
+
+    #[test]
+    fn supersedes_across_agents_sharing_a_terminal() {
+        let origins = vec![origin("claude", "old", "app-1", "window-1")];
+
+        assert_eq!(
+            superseded_origins(&origins, "codex", "new", Some("app-1"), Some("window-1")),
+            vec![("claude".to_owned(), "old".to_owned())]
+        );
+    }
+
+    #[test]
+    fn never_supersedes_subagents() {
+        let mut subagent = origin("codex", "child", "app-1", "window-1");
+        subagent.is_subagent = true;
+
+        assert!(
+            superseded_origins(&[subagent], "codex", "new", Some("app-1"), Some("window-1"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_transport_metadata_supersedes_nothing() {
+        let origins = vec![origin("codex", "old", "app-1", "window-1")];
+
+        assert!(superseded_origins(&origins, "codex", "new", None, None).is_empty());
+    }
+
+    #[test]
+    fn does_not_supersede_when_the_current_session_is_the_only_match() {
+        let origins = vec![origin("codex", "current", "app-1", "window-1")];
+
+        assert!(
+            superseded_origins(
+                &origins,
+                "codex",
+                "current",
+                Some("app-1"),
+                Some("window-1")
+            )
+            .is_empty()
+        );
+    }
 }

@@ -31,7 +31,9 @@ Hook-based session end is not sufficient on its own: Codex exposes no `SessionEn
 
 `Stop` still means turn completion for top-level sessions. Codex subagent sessions are identified from Codex session metadata and are removed when their own `Stop` hook arrives.
 
-Codex also does not expose a compact lifecycle hook. To surface `compacting` state for Codex sessions, `agent-dbus` watches the local Codex TUI log for `op.dispatch.compact` start/close lines and maps those `thread_id` values back to Codex session objects. All regular lifecycle events, approval/input requests, and session metrics still flow through the Unix socket hook path.
+Codex exposes `PreCompact`/`PostCompact`, so `compacting` state comes from hooks when they are configured. `agent-dbus` also watches the local Codex TUI log for `op.dispatch.compact` start/close lines as a fallback for Codex versions that do not emit them. The close path returns the session to `thinking`, because compaction happens inside a turn.
+
+`Interrupt` ends a cancelled turn and returns the session to `idle`, since Codex does not emit `Stop` for an interrupted turn. `/clear` starts a new session without ending the previous one; on `SessionStart`, `agent-dbus` removes any older top-level session sharing the same window or app instance so stale hooks cannot keep reclaiming the window relation. A later `SessionStart` with `source: "resume"` reopens an ended session.
 
 ## Requirements
 
@@ -177,7 +179,10 @@ Add hooks to `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`:
     "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook codex PreToolUse"}]}],
     "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook codex PermissionRequest"}]}],
     "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "agent-hook codex PostToolUse"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "agent-hook codex Stop"}]}]
+    "PreCompact": [{"hooks": [{"type": "command", "command": "agent-hook codex PreCompact"}]}],
+    "PostCompact": [{"hooks": [{"type": "command", "command": "agent-hook codex PostCompact"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "agent-hook codex Stop"}]}],
+    "Interrupt": [{"hooks": [{"type": "command", "command": "agent-hook codex Interrupt"}]}]
   }
 }
 ```
@@ -466,17 +471,18 @@ busctl --user call io.github.AgentDBus /io/github/AgentDBus org.freedesktop.DBus
 | State | Trigger |
 |-------|---------|
 | `no-session` | Default before first event |
-| `idle` | `SessionStart`, `Stop`, `AfterAgent`, or first status update |
-| `thinking` | `UserPromptSubmit`, `BeforeAgent`, `BeforeModel`, `BeforeToolSelection`, `AfterModel`, `PostToolUse`, or `AfterTool` |
+| `idle` | `SessionStart`, `Stop`, `Interrupt`, `AfterAgent`, or first status update |
+| `thinking` | `UserPromptSubmit`, `BeforeAgent`, `BeforeModel`, `BeforeToolSelection`, `AfterModel`, `PostToolUse`, `AfterTool`, or `PostCompact` |
 | `tool-use` | `PreToolUse` or `BeforeTool` |
 | `compacting` | `PreCompact` or `PreCompress` |
+| `PostCompact` | Returns `compacting` to `thinking`; the turn is still running |
 
 ## Flags
 
 | Flag | Set by | Cleared by |
 |------|--------|------------|
-| `TaskComplete` | `Stop`, `AfterAgent`, `TaskCompleted` | `SessionStart`, `UserPromptSubmit`, `BeforeAgent` |
-| `RequiresAttention` | `PermissionRequest`, Gemini `BeforeTool`, `Elicitation`, `RequestUserInput`, `PlanModePrompt`, `AgentTurnCompleteAttention`, `ToolSuggestion`, native Codex approval aliases, `AttentionRequired` | `PostToolUse`, `AfterTool`, user response, matching `*Resolved` events, `AttentionResolved`, `UserPromptSubmit`, `BeforeAgent` |
+| `TaskComplete` | `Stop`, `Interrupt`, `AfterAgent`, `TaskCompleted` | `SessionStart`, `UserPromptSubmit`, `BeforeAgent` |
+| `RequiresAttention` | `PermissionRequest`, Gemini `BeforeTool`, `Elicitation`, `RequestUserInput`, Codex `PreToolUse` for `request_user_input`, `PlanModePrompt`, `AgentTurnCompleteAttention`, `ToolSuggestion`, native Codex approval aliases, `AttentionRequired` | `PostToolUse`, `AfterTool`, user response, matching `*Resolved` events, `AttentionResolved`, `UserPromptSubmit`, `BeforeAgent` |
 
 Non-blocking attention events use internal reason keys so overlapping prompts do not clear each other. `AttentionRequired` and `AttentionResolved` accept `reason`, `kind`, or `attention_kind` in the hook data; if omitted, the reason is `attention`.
 

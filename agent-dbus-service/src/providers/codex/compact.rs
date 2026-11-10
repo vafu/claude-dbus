@@ -86,9 +86,10 @@ async fn apply_codex_compact_log_event(conn: &zbus::Connection, event: CodexComp
             d.task_complete = false;
             d.clear_attention_reasons();
         } else if d.state == SessionState::Compacting {
-            d.state = SessionState::Idle;
-            d.task_complete = true;
-            d.clear_attention_reasons();
+            // Compact runs inside the turn; the agent resumes working unless a
+            // Stop/Interrupt follows. This mirrors the PostCompact hook.
+            d.state = SessionState::Thinking;
+            d.task_complete = false;
         }
     })
     .await

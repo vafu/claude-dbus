@@ -172,7 +172,14 @@ Lifecycle rules:
 
 - `SessionStart` creates/updates a session and sets it `idle`.
 - Prompt/model/tool-start events set `thinking` or `tool-use` as appropriate.
-- `Stop`/`AfterAgent` mark top-level sessions `idle` and `TaskComplete=true`.
+- `Stop`/`AfterAgent`/`Interrupt` mark top-level sessions `idle` and
+  `TaskComplete=true`.
+- `PostCompact` returns a `compacting` session to `thinking`: compaction runs
+  inside a turn.
+- `/clear` starts a new session without ending the old one. A `SessionStart`
+  supersedes older top-level sessions on the same window/app instance so stale
+  hooks cannot reclaim the window relation; `source: "resume"` reopens an
+  ended session.
 - `Stop` for subagent sessions removes the subagent session object.
 - `SessionEnd` removes the session object.
 - Top-level sessions for any agent are also cleaned up when the owning agent
