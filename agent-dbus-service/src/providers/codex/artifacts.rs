@@ -49,18 +49,73 @@ impl<T: Clone> BoundedCache<T> {
     }
 }
 
-pub(crate) fn codex_log_file() -> Option<PathBuf> {
-    Some(codex_home()?.join("log/codex-tui.log"))
+/// Codex homes this service should read from.
+///
+/// A single user routinely runs several Codex profiles side by side, each with
+/// its own `CODEX_HOME` (`~/.codex`, `~/.codex-personal`, `~/.codex-*`). The
+/// service has no way to know which one a hook came from, so it must look at
+/// all of them. `$CODEX_HOME` of the service process (if any) is consulted
+/// first, then the default `~/.codex`, then any sibling `~/.codex-*` profile
+/// directories that look like a Codex home.
+pub(crate) fn codex_homes() -> Vec<PathBuf> {
+    discover_codex_homes(
+        std::env::var_os("CODEX_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
 }
 
-pub(crate) fn codex_home() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".codex")))
+fn discover_codex_homes(env_home: Option<PathBuf>, user_home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut push = |home: PathBuf| {
+        if !homes.contains(&home) {
+            homes.push(home);
+        }
+    };
+
+    if let Some(home) = env_home {
+        push(home);
+    }
+    let Some(user_home) = user_home else {
+        return homes;
+    };
+    push(user_home.join(".codex"));
+
+    let Ok(entries) = std::fs::read_dir(&user_home) else {
+        return homes;
+    };
+    let mut profiles: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".codex-"))
+        })
+        .filter(|path| path.join("sessions").is_dir() || path.join("config.toml").is_file())
+        .collect();
+    profiles.sort();
+    for profile in profiles {
+        push(profile);
+    }
+
+    homes
 }
 
-pub(crate) fn codex_session_index_file() -> Option<PathBuf> {
-    Some(codex_home()?.join("session_index.jsonl"))
+pub(crate) fn codex_log_files() -> Vec<PathBuf> {
+    codex_homes()
+        .into_iter()
+        .map(|home| home.join("log/codex-tui.log"))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+pub(crate) fn codex_session_index_files() -> Vec<PathBuf> {
+    codex_homes()
+        .into_iter()
+        .map(|home| home.join("session_index.jsonl"))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 pub(crate) fn codex_session_file(session_id: &str) -> Option<PathBuf> {
@@ -75,9 +130,10 @@ pub(crate) fn codex_session_file(session_id: &str) -> Option<PathBuf> {
         cache.remove(session_id);
     }
 
-    let sessions_dir = codex_home()?.join("sessions");
     let mut matches = Vec::new();
-    collect_matching_codex_sessions(&sessions_dir, session_id, &mut matches);
+    for home in codex_homes() {
+        collect_matching_codex_sessions(&home.join("sessions"), session_id, &mut matches);
+    }
     let path = matches.into_iter().max_by_key(|path| {
         std::fs::metadata(path)
             .and_then(|metadata| metadata.modified())
@@ -131,5 +187,83 @@ fn collect_matching_codex_sessions(dir: &Path, session_id: &str, matches: &mut V
         {
             matches.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempHome(PathBuf);
+
+    impl TempHome {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "agent-dbus-artifacts-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn discovers_default_and_profile_homes() {
+        let home = TempHome::new("homes");
+        std::fs::create_dir_all(home.0.join(".codex/sessions")).unwrap();
+        std::fs::create_dir_all(home.0.join(".codex-personal/sessions")).unwrap();
+        std::fs::create_dir_all(home.0.join(".codex-databricks")).unwrap();
+        std::fs::write(home.0.join(".codex-databricks/config.toml"), "").unwrap();
+        // A plain dotfile/dir that is not a Codex home must be ignored.
+        std::fs::create_dir_all(home.0.join(".codex-random")).unwrap();
+
+        let homes = discover_codex_homes(None, Some(home.0.clone()));
+
+        assert_eq!(
+            homes,
+            vec![
+                home.0.join(".codex"),
+                home.0.join(".codex-databricks"),
+                home.0.join(".codex-personal"),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_home_is_preferred_and_deduplicated() {
+        let home = TempHome::new("env");
+        std::fs::create_dir_all(home.0.join(".codex/sessions")).unwrap();
+
+        let homes = discover_codex_homes(Some(home.0.join(".codex")), Some(home.0.clone()));
+
+        assert_eq!(homes, vec![home.0.join(".codex")]);
+    }
+
+    #[test]
+    fn collects_session_files_across_homes() {
+        let home = TempHome::new("session");
+        let id = "01a1c739-a0fb-7d92-b797-19578d56a08b";
+        let sessions = home.0.join(".codex-personal/sessions/2026/11/10");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join(format!("rollout-2026-11-10T12-50-05-{id}.jsonl"));
+        std::fs::write(&file, "{}").unwrap();
+
+        let mut matches = Vec::new();
+        for codex_home in discover_codex_homes(None, Some(home.0.clone())) {
+            collect_matching_codex_sessions(&codex_home.join("sessions"), id, &mut matches);
+        }
+
+        assert_eq!(matches, vec![file]);
     }
 }

@@ -1,5 +1,5 @@
 //! Event-driven rollout telemetry. Hooks own lifecycle; this never creates sessions.
-use super::artifacts::{codex_home, codex_session_file};
+use super::artifacts::{codex_homes, codex_session_file};
 use crate::dbus::SessionObject;
 use agent_dbus_core::{
     path::session_path,
@@ -243,9 +243,10 @@ pub(crate) async fn drain(conn: &zbus::Connection, id: &str, remove: bool) -> zb
 }
 
 pub(crate) fn start(conn: zbus::Connection) {
-    let Some(home) = codex_home() else {
+    let homes = codex_homes();
+    if homes.is_empty() {
         return;
-    };
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let watcher =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
@@ -262,9 +263,10 @@ pub(crate) fn start(conn: zbus::Connection) {
         tracing::warn!("cannot start Codex telemetry watcher");
         return;
     };
-    if let Err(err) = watcher.watch(&home, RecursiveMode::Recursive) {
-        tracing::warn!(%err, "cannot watch Codex home");
-        return;
+    for home in &homes {
+        if let Err(err) = watcher.watch(home, RecursiveMode::Recursive) {
+            tracing::warn!(%err, home = %home.display(), "cannot watch Codex home");
+        }
     }
     tokio::spawn(async move {
         let _watcher = watcher;

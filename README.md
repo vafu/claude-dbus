@@ -407,8 +407,13 @@ overlapping totals and breakdowns: do not add cache or reasoning to `total`.
 Future provider adapters must normalize their accounting to this convention.
 
 Codex telemetry follows `turn_context` and `event_msg/token_count` records in
-its rollout under `$CODEX_HOME` (default `~/.codex`). An inotify-backed watcher
-reads complete appended JSONL records without a polling timer. Hooks reconcile
+its rollout under `$CODEX_HOME` (default `~/.codex`). Because several Codex
+profiles commonly run side by side, the service reads every home it can find:
+`$CODEX_HOME` of the service process (if set), `~/.codex`, and any `~/.codex-*`
+profile directory that contains `sessions/` or `config.toml`. Session lookup,
+the TUI log watchers, session-index titles, and `state_5.sqlite` titles all span
+those homes. An inotify-backed watcher reads complete appended JSONL records
+without a polling timer. Hooks reconcile
 the same reader before updates and session removal. Partial lines are retained,
 and replacement/truncation establishes a new epoch and historical baseline.
 Telemetry updates metadata only; it never changes lifecycle state or creates

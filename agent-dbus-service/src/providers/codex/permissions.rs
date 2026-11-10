@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use super::artifacts::codex_homes;
 
 pub(crate) fn is_codex_permission_request(data: &serde_json::Value) -> bool {
     data["hook_event_name"].as_str() == Some("PermissionRequest")
@@ -128,12 +128,17 @@ fn normalize_permission_value(value: &str) -> String {
 }
 
 fn config_approval_reviewer() -> Option<String> {
-    let path = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?
-        .join("config.toml");
-    let config = std::fs::read_to_string(path).ok()?;
-    parse_config_approval_reviewer(&config)
+    // Multiple Codex profiles may be live at once; honor an auto-review
+    // reviewer configured in any of their homes.
+    for home in codex_homes() {
+        let Ok(config) = std::fs::read_to_string(home.join("config.toml")) else {
+            continue;
+        };
+        if let Some(reviewer) = parse_config_approval_reviewer(&config) {
+            return Some(reviewer);
+        }
+    }
+    None
 }
 
 fn parse_config_approval_reviewer(config: &str) -> Option<String> {
