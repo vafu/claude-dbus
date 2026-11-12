@@ -182,12 +182,7 @@ pub async fn handle_hook_connection(
                     d.cwd = cwd.clone();
                     d.cost_usd = cost_usd;
                     apply_usage_limits(d, &agent_name, &session_id, data);
-                    if let Some(state) = hook_state(data) {
-                        d.state = state;
-                    } else if d.state == SessionState::NoSession {
-                        d.state = SessionState::Idle;
-                    }
-                    apply_hook_task_complete(d, data);
+                    apply_update_state(d, data);
                 })
                 .await,
                 "update_session",
@@ -215,11 +210,10 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::Idle;
                     d.model_name = model.clone();
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
-                    d.task_complete = false;
+                    begin_turn(d, SessionState::Idle);
                     clear_pending_and_attention(d);
                 })
                 .await,
@@ -318,8 +312,7 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::Thinking;
-                    d.task_complete = false;
+                    begin_turn(d, SessionState::Thinking);
                     clear_pending_and_attention(d);
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
@@ -340,7 +333,7 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::Thinking;
+                    set_in_turn_state(d, SessionState::Thinking);
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -360,7 +353,7 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::ToolUse;
+                    set_in_turn_state(d, SessionState::ToolUse);
                     d.model_name = model_name(data);
                     d.cwd = data["cwd"].as_str().unwrap_or("").to_string();
                     apply_usage_limits(d, &agent_name, &session_id, data);
@@ -406,7 +399,7 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::ToolUse;
+                    set_in_turn_state(d, SessionState::ToolUse);
                     if is_user_input_tool(data) {
                         d.set_attention_reason("request-user-input");
                     }
@@ -429,7 +422,7 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::Thinking;
+                    set_in_turn_state(d, SessionState::Thinking);
                     clear_transient_attention(d);
                     // The tool ran, so its approval prompt has been answered —
                     // possibly in the agent's own UI, which leaves our request
@@ -480,7 +473,7 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    d.state = SessionState::Compacting;
+                    set_in_turn_state(d, SessionState::Compacting);
                     clear_pending_and_attention(d);
                 })
                 .await,
@@ -498,11 +491,10 @@ pub async fn handle_hook_connection(
                         app_instance_id.as_deref(),
                         window_id.as_deref(),
                     );
-                    if d.state == SessionState::Compacting {
+                    if d.state == SessionState::Compacting && !d.task_complete {
                         // PostCompact fires inside the turn; the agent resumes
                         // working unless a later Stop/Interrupt ends it.
-                        d.state = SessionState::Thinking;
-                        d.task_complete = false;
+                        set_in_turn_state(d, SessionState::Thinking);
                     }
                 })
                 .await,
@@ -1093,12 +1085,42 @@ fn hook_task_complete(data: &serde_json::Value) -> Option<bool> {
     json_bool_at_any(data, paths)
 }
 
-fn apply_hook_task_complete(session: &mut SessionObject, data: &serde_json::Value) {
-    match hook_task_complete(data) {
-        Some(true) => mark_turn_complete(session),
-        Some(false) => session.task_complete = false,
+fn apply_update_state(session: &mut SessionObject, data: &serde_json::Value) {
+    let requested_state = hook_state(data);
+    let completes = hook_task_complete(data) == Some(true);
+
+    if completes {
+        mark_turn_complete(session);
+        return;
+    }
+
+    // Completion is sticky until an explicit turn-start event. A late hook
+    // from the completed turn may still carry `task_complete: false`, and
+    // honoring it would let that hook resurrect the finished turn.
+    match requested_state {
+        Some(state) if session.task_complete && is_in_turn_state(&state) => {}
+        Some(state) => session.state = state,
+        None if session.state == SessionState::NoSession => session.state = SessionState::Idle,
         None => {}
     }
+}
+
+fn is_in_turn_state(state: &SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Thinking | SessionState::ToolUse | SessionState::Compacting
+    )
+}
+
+fn set_in_turn_state(session: &mut SessionObject, state: SessionState) {
+    if !session.task_complete {
+        session.state = state;
+    }
+}
+
+fn begin_turn(session: &mut SessionObject, state: SessionState) {
+    session.state = state;
+    session.task_complete = false;
 }
 
 fn mark_turn_complete(session: &mut SessionObject) {
@@ -1287,8 +1309,11 @@ fn apply_nonblocking_attention(
     state: SessionState,
     task_complete: bool,
 ) {
-    session.state = state;
-    session.task_complete = task_complete;
+    if task_complete {
+        mark_turn_complete(session);
+    } else {
+        set_in_turn_state(session, state);
+    }
     session.set_attention_reason(reason);
     session.model_name = model_name(data);
     session.cwd = data["cwd"].as_str().unwrap_or("").to_string();
@@ -1790,13 +1815,74 @@ mod tests {
         session.state = SessionState::Thinking;
         session.task_complete = false;
 
-        apply_hook_task_complete(
+        apply_update_state(
             &mut session,
             &json!({ "payload": { "taskComplete": true } }),
         );
 
         assert!(matches!(session.state, SessionState::Idle));
         assert!(session.task_complete);
+    }
+
+    #[test]
+    fn late_update_state_does_not_resurrect_a_completed_turn() {
+        let mut session = SessionObject::new("codex", "session-1");
+        mark_turn_complete(&mut session);
+
+        apply_update_state(&mut session, &json!({ "status": "busy" }));
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.task_complete);
+
+        apply_update_state(&mut session, &json!({ "task_complete": false }));
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.task_complete);
+    }
+
+    #[test]
+    fn a_new_turn_clears_sticky_completion() {
+        let mut session = SessionObject::new("codex", "session-1");
+        mark_turn_complete(&mut session);
+
+        begin_turn(&mut session, SessionState::Thinking);
+
+        assert!(matches!(session.state, SessionState::Thinking));
+        assert!(!session.task_complete);
+    }
+
+    #[test]
+    fn late_tool_and_compact_state_do_not_override_completion() {
+        let mut session = SessionObject::new("codex", "session-1");
+        mark_turn_complete(&mut session);
+
+        set_in_turn_state(&mut session, SessionState::ToolUse);
+        assert!(matches!(session.state, SessionState::Idle));
+
+        set_in_turn_state(&mut session, SessionState::Thinking);
+        assert!(matches!(session.state, SessionState::Idle));
+
+        set_in_turn_state(&mut session, SessionState::Compacting);
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.task_complete);
+    }
+
+    #[test]
+    fn late_attention_alias_does_not_override_completion() {
+        let mut session = SessionObject::new("codex", "session-1");
+        mark_turn_complete(&mut session);
+
+        apply_nonblocking_attention(
+            &mut session,
+            "codex",
+            "session-1",
+            &json!({ "cwd": "/tmp/project", "model": "gpt-test" }),
+            "exec-approval",
+            SessionState::Thinking,
+            false,
+        );
+
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.task_complete);
+        assert!(session.requires_attention);
     }
 
     #[test]

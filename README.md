@@ -482,6 +482,14 @@ busctl --user call io.github.AgentDBus /io/github/AgentDBus org.freedesktop.DBus
 | `compacting` | `PreCompact` or `PreCompress` |
 | `PostCompact` | Returns `compacting` to `thinking`; the turn is still running |
 
+Completion is sticky until the next turn starts. A late hook from the finished
+turn cannot move `State` back to `thinking`, `tool-use`, or `compacting` after
+`Stop`, `AfterAgent`, `Interrupt`, or `TaskCompleted` has set `TaskComplete`.
+`SessionStart`, `UserPromptSubmit`, `BeforeAgent`, `BeforeModel`, and
+`BeforeToolSelection` begin a new turn and clear it. This ordering guarantee
+matters because hook connections are processed concurrently, so an earlier
+tool event may still be applying after the completion event arrives.
+
 ## Flags
 
 | Flag | Set by | Cleared by |

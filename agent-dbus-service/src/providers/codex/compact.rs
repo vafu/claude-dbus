@@ -90,6 +90,12 @@ fn parse_thread_id(line: &str) -> Option<&str> {
 
 async fn apply_codex_compact_log_event(conn: &zbus::Connection, event: CodexCompactLogEvent) {
     if let Err(err) = update_session(conn, "codex", &event.session_id, |d| {
+        // Completion is sticky until the next turn starts. The compact log
+        // watcher lags hook delivery, so a close line for a turn that already
+        // stopped must not resurrect it as `thinking`.
+        if d.task_complete {
+            return;
+        }
         if event.active {
             d.state = SessionState::Compacting;
             d.task_complete = false;
@@ -98,7 +104,6 @@ async fn apply_codex_compact_log_event(conn: &zbus::Connection, event: CodexComp
             // Compact runs inside the turn; the agent resumes working unless a
             // Stop/Interrupt follows. This mirrors the PostCompact hook.
             d.state = SessionState::Thinking;
-            d.task_complete = false;
         }
     })
     .await
